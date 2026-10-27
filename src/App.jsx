@@ -11,6 +11,8 @@ export default function App() {
 
   const [macros, setMacros] = useState([]);
   const [auditLogs, setAuditLogs] = useState([]);
+  const [chatHistory, setChatHistory] = useState([]);
+
   const [newTrigger, setNewTrigger] = useState("");
   const [newActionType, setNewActionType] = useState("launch_app");
   const [newPayloadVal, setNewPayloadVal] = useState("calc.exe");
@@ -22,6 +24,7 @@ export default function App() {
   useEffect(() => {
     fetchMacros();
     fetchAuditLogs();
+    fetchChatHistory();
   }, []);
 
   const fetchMacros = async () => {
@@ -41,6 +44,16 @@ export default function App() {
       setAuditLogs(data);
     } catch (err) {
       console.error("Failed to fetch audit logs:", err);
+    }
+  };
+
+  const fetchChatHistory = async () => {
+    try {
+      const res = await fetch("http://127.0.0.1:8000/chat-history");
+      const data = await res.json();
+      setChatHistory(data);
+    } catch (err) {
+      console.error("Failed to fetch chat history:", err);
     }
   };
 
@@ -90,6 +103,7 @@ export default function App() {
         data.reply || data.executed || data.message || "Speech processed";
       setStatus(`KALKI: ${responseText}`);
       fetchAuditLogs();
+      fetchChatHistory();
     } catch (err) {
       console.error("Voice listening error:", err);
       setStatus("Failed to access backend voice service");
@@ -106,15 +120,20 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command: commandText }),
       });
-      const data = await response.json();
 
+      if (!response.ok) {
+        throw new Error(`Server returned status ${response.status}`);
+      }
+
+      const data = await response.json();
       const responseText =
         data.reply || data.executed || data.message || "Command processed.";
       setStatus(`KALKI: ${responseText}`);
       fetchAuditLogs();
+      fetchChatHistory();
     } catch (err) {
       console.error("Error sending command:", err);
-      setStatus("KALKI: Failed to reach backend core");
+      setStatus(`KALKI: Error - ${err.message}`);
     }
   };
 
@@ -190,6 +209,51 @@ export default function App() {
     }
   };
 
+  const handleAnalyzeAndClick = async () => {
+    if (!videoRef.current || !screenSharing) {
+      setStatus("KALKI: Please start screen share first.");
+      return;
+    }
+
+    setStatus("KALKI: Capturing screen and analyzing UI elements...");
+    try {
+      const video = videoRef.current;
+      const canvas = document.createElement("canvas");
+      canvas.width = video.videoWidth || window.innerWidth;
+      canvas.height = video.videoHeight || window.innerHeight;
+
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      const base64Image = canvas.toDataURL("image/jpeg", 0.8);
+
+      const response = await fetch("http://127.0.0.1:8000/process-frame", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image_base64: base64Image }),
+      });
+      const data = await response.json();
+
+      if (data.sample_boxes && data.sample_boxes.length > 0) {
+        const clickRes = await fetch("http://127.0.0.1:8000/visual-click", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            box_index: 0,
+            bounding_boxes: data.sample_boxes,
+          }),
+        });
+        const clickData = await clickRes.json();
+        setStatus(`KALKI: ${clickData.reply}`);
+      } else {
+        setStatus("KALKI: Visual Core found no interactive UI elements.");
+      }
+    } catch (err) {
+      console.error("Visual targeting error:", err);
+      setStatus("KALKI: Failed visual analysis");
+    }
+  };
+
   return (
     <div
       style={{
@@ -242,6 +306,20 @@ export default function App() {
         >
           Audit Logs ({auditLogs.length})
         </button>
+        <button
+          onClick={() => {
+            setActiveTab("chat");
+            fetchChatHistory();
+          }}
+          style={{
+            padding: "0.6rem 1.2rem",
+            cursor: "pointer",
+            borderBottom: activeTab === "chat" ? "2px solid #2563eb" : "none",
+            fontWeight: activeTab === "chat" ? "bold" : "normal",
+          }}
+        >
+          Chat Memory ({chatHistory.length})
+        </button>
       </div>
 
       <div
@@ -291,7 +369,14 @@ export default function App() {
             </button>
           </form>
 
-          <div style={{ display: "flex", gap: "1rem", marginBottom: "1.5rem" }}>
+          <div
+            style={{
+              display: "flex",
+              gap: "1rem",
+              marginBottom: "1.5rem",
+              flexWrap: "wrap",
+            }}
+          >
             <button
               onClick={triggerBackendVoice}
               disabled={listening}
@@ -325,6 +410,21 @@ export default function App() {
               }}
             >
               Analyze Frame (OpenCV)
+            </button>
+
+            <button
+              onClick={handleAnalyzeAndClick}
+              style={{
+                padding: "0.6rem 1.2rem",
+                fontSize: "1rem",
+                cursor: "pointer",
+                background: "#2563eb",
+                color: "#fff",
+                border: "none",
+                borderRadius: "4px",
+              }}
+            >
+              Analyze & Target Click
             </button>
           </div>
 
@@ -423,7 +523,7 @@ export default function App() {
           <ul>
             {macros.map((m) => (
               <li key={m.id} style={{ marginBottom: "0.5rem" }}>
-                <strong>"{m.trigger_phrase}"</strong> $\rightarrow${" "}
+                <strong>"{m.trigger_phrase}"</strong> &rarr;{" "}
                 <code>{m.action_type}</code> ({JSON.stringify(m.action_payload)}
                 )
               </li>
@@ -436,12 +536,12 @@ export default function App() {
         <div>
           <h3>Recent PostgreSQL Audit Logs</h3>
           <button
-            onClick={fetchAuditLogs}
             style={{
               padding: "0.4rem 0.8rem",
               marginBottom: "1rem",
               cursor: "pointer",
             }}
+            onClick={fetchAuditLogs}
           >
             Refresh Logs
           </button>
@@ -457,6 +557,61 @@ export default function App() {
           >
             {JSON.stringify(auditLogs, null, 2)}
           </pre>
+        </div>
+      )}
+
+      {activeTab === "chat" && (
+        <div>
+          <h3>PostgreSQL Multi-Turn Chat Memory</h3>
+          <button
+            onClick={fetchChatHistory}
+            style={{
+              padding: "0.4rem 0.8rem",
+              marginBottom: "1rem",
+              cursor: "pointer",
+            }}
+          >
+            Refresh Chat History
+          </button>
+          <div
+            style={{
+              background: "#1e293b",
+              color: "#f8fafc",
+              padding: "1rem",
+              borderRadius: "6px",
+              maxHeight: "400px",
+              overflowY: "auto",
+            }}
+          >
+            {chatHistory.map((msg, idx) => (
+              <div
+                key={idx}
+                style={{
+                  marginBottom: "0.75rem",
+                  borderBottom: "1px solid #334155",
+                  paddingBottom: "0.5rem",
+                }}
+              >
+                <strong
+                  style={{
+                    color: msg.role === "user" ? "#38bdf8" : "#4ade80",
+                  }}
+                >
+                  {msg.role === "user" ? "User" : "KALKI"}:
+                </strong>{" "}
+                <span>{msg.content}</span>
+                <div
+                  style={{
+                    fontSize: "0.75rem",
+                    color: "#94a3b8",
+                    marginTop: "0.2rem",
+                  }}
+                >
+                  {msg.timestamp}
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>

@@ -6,17 +6,16 @@ from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from groq import Groq
 
-# Load .env explicitly from the backend/ folder relative to this file
 env_path = Path(__file__).resolve().parent / ".env"
-load_dotenv(dotenv_path=env_path, override=True)
+load_dotenv(dotenv_path=env_path)
 
 api_key = os.getenv("GEMINI_API_KEY")
-client = (
-    genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=10000))
-    if api_key and api_key.strip() != ""
-    else None
-)
+client = genai.Client(api_key=api_key) if api_key and api_key.strip() != "" else None
+
+groq_api_key = os.getenv("GROQ_API_KEY")
+groq_client = Groq(api_key=groq_api_key) if groq_api_key and groq_api_key.strip() != "" else None
 
 APP_MAP = {
     "calculator": "calc",
@@ -76,47 +75,82 @@ Rules:
 3. Provide direct answers to general knowledge questions.
 """
 
-def process_jarvis_intent(user_prompt: str) -> dict:
+def process_jarvis_intent(user_prompt: str, chat_history: list = None) -> dict:
     # 1. 0ms Fast-Path Local Router
     handled, result = fast_path_local_router(user_prompt)
     if handled:
         return result
 
-    # 2. Cloud Gemini LLM Core
+    # 2. Try Cloud Gemini LLM Core first
     if client:
         try:
+            formatted_contents = []
+            if chat_history:
+                for msg in chat_history:
+                    role = "user" if msg["role"] == "user" else "model"
+                    formatted_contents.append(
+                        types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])])
+                    )
+            
+            formatted_contents.append(
+                types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)])
+            )
+
             response = client.models.generate_content(
                 model='gemini-3.8-flash',
-                contents=user_prompt,
+                contents=formatted_contents,
                 config=types.GenerateContentConfig(
                     system_instruction=JARVIS_SYSTEM_INSTRUCTION,
                     temperature=0.2,
-                    http_options=types.HttpOptions(timeout=10000),
                 ),
             )
-            reply_text = response.text.strip() if response.text else "No content returned from model."
-            return {"reply": reply_text, "tool_executed": "Gemini 3.8 Flash Core"}
-        except TimeoutError as te:
-            print(f"[Gemini API Timeout]: {str(te)}")
-            return {
-                "reply": "Cloud Core request timed out. Please try again.",
-                "tool_executed": None
-            }
+            return {"reply": response.text.strip(), "tool_executed": "Gemini 3.8 Flash Core"}
         except Exception as err:
-            err_msg = str(err)
-            print(f"[Gemini API Error]: {err_msg}")
-            if "timeout" in err_msg.lower() or "timed out" in err_msg.lower():
-                return {
-                    "reply": "Cloud Core request timed out. Please check your connection.",
-                    "tool_executed": None
-                }
-            return {
-                "reply": f"Cloud Core Error: {err_msg}",
-                "tool_executed": None
-            }
+            print(f"[Gemini API Limit/Error]: {str(err)} -> Falling back to Groq Llama 3.3")
 
-    print(f"[Warning]: GEMINI_API_KEY is missing or invalid in {env_path}")
+    # 3. Fallback to Groq Llama 3.3 if Gemini fails or hits quota limits
+    # 3. Fallback to Groq if Gemini fails or hits quota limits
+    if groq_client:
+        try:
+            messages = [{"role": "system", "content": JARVIS_SYSTEM_INSTRUCTION}]
+            if chat_history:
+                for msg in chat_history:
+                    messages.append({"role": msg["role"], "content": msg["content"]})
+            messages.append({"role": "user", "content": user_prompt})
+
+            completion = groq_client.chat.completions.create(
+                model="openai/gpt-oss-120b",
+                messages=messages,
+                temperature=0.2,
+                max_tokens=1024,
+            )
+            reply_text = completion.choices[0].message.content.strip()
+            return {"reply": reply_text, "tool_executed": "Groq GPT-OSS 120B Fallback Core"}
+        except Exception as groq_err:
+            print(f"[Groq API Error]: {str(groq_err)}")
+            return {"reply": f"All Cloud Core Failovers Failed: {str(groq_err)}", "tool_executed": None}
     return {
-        "reply": f"GEMINI_API_KEY is missing in backend/.env file. Please set a valid key.",
+        "reply": "Both GEMINI_API_KEY and GROQ_API_KEY are missing or exhausted in backend/.env.",
         "tool_executed": None
     }
+
+def click_at_coordinates(x: int, y: int) -> str:
+    """Clicks directly on desktop screen coordinates (x, y)."""
+    try:
+        pyautogui.click(x=x, y=y)
+        return f"Clicked targeted screen coordinates ({x}, {y})"
+    except Exception as e:
+        return f"Failed to click coordinates ({x}, {y}): {str(e)}"
+
+def click_bounding_box(box_index: int, bounding_boxes: list) -> str:
+    """Calculates center of target OpenCV bounding box and clicks it."""
+    try:
+        if 0 <= box_index < len(bounding_boxes):
+            box = bounding_boxes[box_index]
+            center_x = box["x"] + (box["w"] // 2)
+            center_y = box["y"] + (box["h"] // 2)
+            pyautogui.click(x=center_x, y=center_y)
+            return f"Targeted UI box #{box_index}: Clicked at center ({center_x}, {center_y})"
+        return f"Invalid bounding box index: {box_index}"
+    except Exception as e:
+        return f"Visual click failed: {str(e)}"
