@@ -9,7 +9,6 @@ export default function App() {
   const [screenSharing, setScreenSharing] = useState(false);
   const [visionAnalysis, setVisionAnalysis] = useState(null);
 
-  // Database State
   const [macros, setMacros] = useState([]);
   const [auditLogs, setAuditLogs] = useState([]);
   const [newTrigger, setNewTrigger] = useState('');
@@ -67,7 +66,7 @@ export default function App() {
       if (res.ok) {
         setNewTrigger('');
         fetchMacros();
-        setStatus('Macro added to PostgreSQL successfully.');
+        setStatus('Macro registered in PostgreSQL');
       }
     } catch (err) {
       console.error('Failed to add macro:', err);
@@ -81,13 +80,11 @@ export default function App() {
       const response = await fetch('http://127.0.0.1:8000/listen-voice', { method: 'POST' });
       const data = await response.json();
 
-      if (data.status === 'success') {
-        setTranscript(data.transcript);
-        setStatus(`Executed: ${data.message}`);
-        fetchAuditLogs();
-      } else {
-        setStatus(`Voice Status: ${data.message || data.status}`);
-      }
+      if (data.transcript) setTranscript(data.transcript);
+      
+      const responseText = data.reply || data.executed || data.message || 'Speech processed';
+      setStatus(`KALKI: ${responseText}`);
+      fetchAuditLogs();
     } catch (err) {
       console.error('Voice listening error:', err);
       setStatus('Failed to access backend voice service');
@@ -104,7 +101,9 @@ export default function App() {
         body: JSON.stringify({ command: commandText })
       });
       const data = await response.json();
-      setStatus(`Result: ${data.message}`);
+      
+      const responseText = data.reply || data.executed || data.message || 'Command executed';
+      setStatus(`KALKI: ${responseText}`);
       fetchAuditLogs();
     } catch (err) {
       console.error('Error sending command:', err);
@@ -185,7 +184,6 @@ export default function App() {
     <div style={{ padding: '2rem', fontFamily: 'system-ui, sans-serif', color: '#1a1a1a' }}>
       <h1>KALKI Assistant Core</h1>
 
-      {/* Navigation Tabs */}
       <div style={{ display: 'flex', gap: '1rem', borderBottom: '2px solid #e4e4e7', marginBottom: '1.5rem' }}>
         <button 
           onClick={() => setActiveTab('controls')}
@@ -219,7 +217,7 @@ export default function App() {
               type="text"
               value={manualCommand}
               onChange={(e) => setManualCommand(e.target.value)}
-              placeholder="Type command (e.g., 'open calculator')..."
+              placeholder="Type command (e.g., 'you have to open calculator')..."
               style={{ flex: 1, padding: '0.6rem', fontSize: '1rem', borderRadius: '4px', border: '1px solid #ccc' }}
             />
             <button type="submit" style={{ padding: '0.6rem 1.2rem', fontSize: '1rem', cursor: 'pointer' }}>
@@ -271,7 +269,7 @@ export default function App() {
           <form onSubmit={handleAddMacro} style={{ display: 'flex', gap: '0.5rem', marginBottom: '1.5rem', flexWrap: 'wrap' }}>
             <input
               type="text"
-              placeholder="Trigger Phrase (e.g., 'open calculator')"
+              placeholder="Trigger Phrase (e.g., 'dev mode')"
               value={newTrigger}
               onChange={(e) => setNewTrigger(e.target.value)}
               style={{ padding: '0.5rem', flex: 1 }}
