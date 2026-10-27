@@ -1,0 +1,27 @@
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# Dependencies
+node_modules/
+
+# Build & Output Directories
+dist/
+build/
+out/
+
+# Python Caches & Compiled Files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Environment Variables & Logs
+.env
+*.log
+
+# OS Metadata
+.DS_Store
+Thumbs.db
