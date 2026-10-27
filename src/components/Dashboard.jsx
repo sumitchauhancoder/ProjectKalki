@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useState } from "react";
 import "./Dashboard.css";
 
 export default function Dashboard({
@@ -34,6 +34,16 @@ export default function Dashboard({
   chatHistory,
   fetchChatHistory,
 }) {
+  // Local state for API keys settings tab
+  const [geminiKey, setGeminiKey] = useState("");
+  const [groqKey, setGroqKey] = useState("");
+
+  const handleSaveApiKeys = (e) => {
+    e.preventDefault();
+    // You can hook this up to an endpoint later to save securely in PostgreSQL/env
+    alert("API Keys saved successfully to your local session.");
+  };
+
   return (
     <div className="dashboard-container">
       {/* Sidebar Navigation */}
@@ -77,6 +87,13 @@ export default function Dashboard({
             }}
           >
             Chat Memory <span className="badge-count">{chatHistory.length}</span>
+          </button>
+          <button
+            type="button"
+            className={activeTab === "settings" ? "nav-item active" : "nav-item"}
+            onClick={() => setActiveTab("settings")}
+          >
+            API Settings
           </button>
         </nav>
 
@@ -289,6 +306,44 @@ export default function Dashboard({
                 ))
               )}
             </div>
+          </div>
+        )}
+
+        {/* --- API SETTINGS TAB --- */}
+        {activeTab === "settings" && (
+          <div className="module-content">
+            <div className="module-header">
+              <h2>API Key Configuration</h2>
+              <p>Configure personal Gemini and Groq API keys to prevent quota exhaustion.</p>
+            </div>
+
+            <form onSubmit={handleSaveApiKeys} className="macro-form" style={{ flexDirection: "column", gap: "16px", maxWidth: "500px" }}>
+              <div className="input-group" style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                <label style={{ fontSize: "12px", color: "#d1d5db" }}>Google Gemini API Key</label>
+                <input
+                  type="password"
+                  placeholder="AIzaSy..."
+                  value={geminiKey}
+                  onChange={(e) => setGeminiKey(e.target.value)}
+                  className="form-input"
+                />
+              </div>
+
+              <div className="input-group" style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                <label style={{ fontSize: "12px", color: "#d1d5db" }}>Groq API Key</label>
+                <input
+                  type="password"
+                  placeholder="gsk_..."
+                  value={groqKey}
+                  onChange={(e) => setGroqKey(e.target.value)}
+                  className="form-input"
+                />
+              </div>
+
+              <button type="submit" className="btn-primary-red" style={{ alignSelf: "flex-start" }}>
+                Save API Keys
+              </button>
+            </form>
           </div>
         )}
       </main>

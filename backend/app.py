@@ -20,11 +20,12 @@ from database import Base, engine, get_db
 import models
 from llm_engine import process_jarvis_intent, click_bounding_box, click_at_coordinates
 from tts_engine import speak_text
+from auth import auth_router
 
-Base.metadata.create_all(bind=engine)
-
+# 1. Initialize FastAPI app first
 app = FastAPI(title="KALKI Core Engine", version="1.0.0")
 
+# 2. Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,6 +33,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 3. Include Auth Router and create database tables
+app.include_router(auth_router)
+Base.metadata.create_all(bind=engine)
 
 recognizer = sr.Recognizer()
 
@@ -312,4 +317,4 @@ async def visual_click(payload: VisualClickPayload, db: Session = Depends(get_db
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
