@@ -1,6 +1,13 @@
 import React, { useState, useEffect, useRef } from "react";
+import Home from "./components/Home";
+import Login from "./components/Login";
+import Dashboard from "./components/Dashboard";
 
 export default function App() {
+  // Navigation state: 'home', 'login', or 'dashboard'
+  const [currentView, setCurrentView] = useState("home");
+  const [currentUser, setCurrentUser] = useState(null);
+
   const [activeTab, setActiveTab] = useState("controls");
   const [transcript, setTranscript] = useState("");
   const [manualCommand, setManualCommand] = useState("");
@@ -22,10 +29,12 @@ export default function App() {
   const streamRef = useRef(null);
 
   useEffect(() => {
-    fetchMacros();
-    fetchAuditLogs();
-    fetchChatHistory();
-  }, []);
+    if (currentView === "dashboard") {
+      fetchMacros();
+      fetchAuditLogs();
+      fetchChatHistory();
+    }
+  }, [currentView]);
 
   const fetchMacros = async () => {
     try {
@@ -254,366 +263,64 @@ export default function App() {
     }
   };
 
-  return (
-    <div
-      style={{
-        padding: "2rem",
-        fontFamily: "system-ui, sans-serif",
-        color: "#1a1a1a",
-      }}
-    >
-      <h1>KALKI Assistant Core</h1>
+  // --- RENDER ROUTING ---
+  if (currentView === "home") {
+    return <Home onNavigate={(view) => setCurrentView(view)} />;
+  }
 
-      <div
-        style={{
-          display: "flex",
-          gap: "1rem",
-          borderBottom: "2px solid #e4e4e7",
-          marginBottom: "1.5rem",
+  if (currentView === "login") {
+    return (
+      <Login 
+        onLoginSuccess={(user) => {
+          setCurrentUser(user);
+          setCurrentView("dashboard");
+          setStatus("KALKI: Core session initialized.");
         }}
-      >
-        <button
-          onClick={() => setActiveTab("controls")}
-          style={{
-            padding: "0.6rem 1.2rem",
-            cursor: "pointer",
-            borderBottom:
-              activeTab === "controls" ? "2px solid #2563eb" : "none",
-            fontWeight: activeTab === "controls" ? "bold" : "normal",
-          }}
-        >
-          Control Center
-        </button>
-        <button
-          onClick={() => setActiveTab("macros")}
-          style={{
-            padding: "0.6rem 1.2rem",
-            cursor: "pointer",
-            borderBottom: activeTab === "macros" ? "2px solid #2563eb" : "none",
-            fontWeight: activeTab === "macros" ? "bold" : "normal",
-          }}
-        >
-          Voice Macros ({macros.length})
-        </button>
-        <button
-          onClick={() => setActiveTab("logs")}
-          style={{
-            padding: "0.6rem 1.2rem",
-            cursor: "pointer",
-            borderBottom: activeTab === "logs" ? "2px solid #2563eb" : "none",
-            fontWeight: activeTab === "logs" ? "bold" : "normal",
-          }}
-        >
-          Audit Logs ({auditLogs.length})
-        </button>
-        <button
-          onClick={() => {
-            setActiveTab("chat");
-            fetchChatHistory();
-          }}
-          style={{
-            padding: "0.6rem 1.2rem",
-            cursor: "pointer",
-            borderBottom: activeTab === "chat" ? "2px solid #2563eb" : "none",
-            fontWeight: activeTab === "chat" ? "bold" : "normal",
-          }}
-        >
-          Chat Memory ({chatHistory.length})
-        </button>
-      </div>
+        onBackToHome={() => setCurrentView("home")} 
+      />
+    );
+  }
 
-      <div
-        style={{
-          padding: "1rem",
-          background: "#f4f4f5",
-          borderRadius: "8px",
-          marginBottom: "1.5rem",
+  if (currentView === "dashboard") {
+    return (
+      <Dashboard
+        currentUser={currentUser}
+        onLogout={() => {
+          setCurrentUser(null);
+          setCurrentView("home");
         }}
-      >
-        <p>
-          Engine Status: <strong>{status}</strong>
-        </p>
-        <p>
-          Last Command: <em>{transcript || "None"}</em>
-        </p>
-      </div>
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        status={status}
+        transcript={transcript}
+        manualCommand={manualCommand}
+        setManualCommand={setManualCommand}
+        handleManualSubmit={handleManualSubmit}
+        triggerBackendVoice={triggerBackendVoice}
+        listening={listening}
+        screenSharing={screenSharing}
+        startScreenCapture={startScreenCapture}
+        stopScreenCapture={stopScreenCapture}
+        analyzeCurrentFrame={analyzeCurrentFrame}
+        handleAnalyzeAndClick={handleAnalyzeAndClick}
+        canvasRef={canvasRef}
+        videoRef={videoRef}
+        visionAnalysis={visionAnalysis}
+        macros={macros}
+        newTrigger={newTrigger}
+        setNewTrigger={setNewTrigger}
+        newActionType={newActionType}
+        setNewActionType={setNewActionType}
+        newPayloadVal={newPayloadVal}
+        setNewPayloadVal={setNewPayloadVal}
+        handleAddMacro={handleAddMacro}
+        auditLogs={auditLogs}
+        fetchAuditLogs={fetchAuditLogs}
+        chatHistory={chatHistory}
+        fetchChatHistory={fetchChatHistory}
+      />
+    );
+  }
 
-      {activeTab === "controls" && (
-        <>
-          <form
-            onSubmit={handleManualSubmit}
-            style={{ display: "flex", gap: "0.5rem", marginBottom: "1.5rem" }}
-          >
-            <input
-              type="text"
-              value={manualCommand}
-              onChange={(e) => setManualCommand(e.target.value)}
-              placeholder="Type command (e.g., 'you have to open calculator')..."
-              style={{
-                flex: 1,
-                padding: "0.6rem",
-                fontSize: "1rem",
-                borderRadius: "4px",
-                border: "1px solid #ccc",
-              }}
-            />
-            <button
-              type="submit"
-              style={{
-                padding: "0.6rem 1.2rem",
-                fontSize: "1rem",
-                cursor: "pointer",
-              }}
-            >
-              Execute
-            </button>
-          </form>
-
-          <div
-            style={{
-              display: "flex",
-              gap: "1rem",
-              marginBottom: "1.5rem",
-              flexWrap: "wrap",
-            }}
-          >
-            <button
-              onClick={triggerBackendVoice}
-              disabled={listening}
-              style={{
-                padding: "0.6rem 1.2rem",
-                fontSize: "1rem",
-                cursor: listening ? "not-allowed" : "pointer",
-              }}
-            >
-              {listening ? "Listening (4s)..." : "Speak Command"}
-            </button>
-
-            <button
-              onClick={screenSharing ? stopScreenCapture : startScreenCapture}
-              style={{
-                padding: "0.6rem 1.2rem",
-                fontSize: "1rem",
-                cursor: "pointer",
-              }}
-            >
-              {screenSharing ? "Stop Screen Share" : "Start Screen Share"}
-            </button>
-
-            <button
-              onClick={analyzeCurrentFrame}
-              disabled={!screenSharing}
-              style={{
-                padding: "0.6rem 1.2rem",
-                fontSize: "1rem",
-                cursor: screenSharing ? "pointer" : "not-allowed",
-              }}
-            >
-              Analyze Frame (OpenCV)
-            </button>
-
-            <button
-              onClick={handleAnalyzeAndClick}
-              style={{
-                padding: "0.6rem 1.2rem",
-                fontSize: "1rem",
-                cursor: "pointer",
-                background: "#2563eb",
-                color: "#fff",
-                border: "none",
-                borderRadius: "4px",
-              }}
-            >
-              Analyze & Target Click
-            </button>
-          </div>
-
-          <canvas ref={canvasRef} style={{ display: "none" }} />
-
-          {screenSharing && (
-            <div style={{ marginTop: "1rem" }}>
-              <h3>Active Screen Feed</h3>
-              <video
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
-                style={{
-                  width: "100%",
-                  maxHeight: "400px",
-                  borderRadius: "8px",
-                  border: "1px solid #ccc",
-                  backgroundColor: "#000",
-                }}
-              />
-            </div>
-          )}
-
-          {visionAnalysis && (
-            <div
-              style={{
-                marginTop: "1.5rem",
-                padding: "1rem",
-                background: "#eef2ff",
-                borderRadius: "8px",
-              }}
-            >
-              <h3>OpenCV Analysis Results</h3>
-              <pre
-                style={{
-                  background: "#1e293b",
-                  color: "#f8fafc",
-                  padding: "1rem",
-                  borderRadius: "6px",
-                }}
-              >
-                {JSON.stringify(visionAnalysis, null, 2)}
-              </pre>
-            </div>
-          )}
-        </>
-      )}
-
-      {activeTab === "macros" && (
-        <div>
-          <h3>Add Voice Macro to PostgreSQL</h3>
-          <form
-            onSubmit={handleAddMacro}
-            style={{
-              display: "flex",
-              gap: "0.5rem",
-              marginBottom: "1.5rem",
-              flexWrap: "wrap",
-            }}
-          >
-            <input
-              type="text"
-              placeholder="Trigger Phrase (e.g., 'dev mode')"
-              value={newTrigger}
-              onChange={(e) => setNewTrigger(e.target.value)}
-              style={{ padding: "0.5rem", flex: 1 }}
-              required
-            />
-            <select
-              value={newActionType}
-              onChange={(e) => setNewActionType(e.target.value)}
-              style={{ padding: "0.5rem" }}
-            >
-              <option value="launch_app">Launch Application</option>
-              <option value="hotkey">Keyboard Hotkey</option>
-              <option value="type_text">Type Text</option>
-            </select>
-            <input
-              type="text"
-              placeholder="Payload (e.g., 'calc.exe' or 'win+r')"
-              value={newPayloadVal}
-              onChange={(e) => setNewPayloadVal(e.target.value)}
-              style={{ padding: "0.5rem", flex: 1 }}
-              required
-            />
-            <button
-              type="submit"
-              style={{ padding: "0.5rem 1rem", cursor: "pointer" }}
-            >
-              Add Macro
-            </button>
-          </form>
-
-          <h3>Registered Voice Macros</h3>
-          <ul>
-            {macros.map((m) => (
-              <li key={m.id} style={{ marginBottom: "0.5rem" }}>
-                <strong>"{m.trigger_phrase}"</strong> &rarr;{" "}
-                <code>{m.action_type}</code> ({JSON.stringify(m.action_payload)}
-                )
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {activeTab === "logs" && (
-        <div>
-          <h3>Recent PostgreSQL Audit Logs</h3>
-          <button
-            style={{
-              padding: "0.4rem 0.8rem",
-              marginBottom: "1rem",
-              cursor: "pointer",
-            }}
-            onClick={fetchAuditLogs}
-          >
-            Refresh Logs
-          </button>
-          <pre
-            style={{
-              background: "#1e293b",
-              color: "#f8fafc",
-              padding: "1rem",
-              borderRadius: "6px",
-              maxHeight: "400px",
-              overflowY: "auto",
-            }}
-          >
-            {JSON.stringify(auditLogs, null, 2)}
-          </pre>
-        </div>
-      )}
-
-      {activeTab === "chat" && (
-        <div>
-          <h3>PostgreSQL Multi-Turn Chat Memory</h3>
-          <button
-            onClick={fetchChatHistory}
-            style={{
-              padding: "0.4rem 0.8rem",
-              marginBottom: "1rem",
-              cursor: "pointer",
-            }}
-          >
-            Refresh Chat History
-          </button>
-          <div
-            style={{
-              background: "#1e293b",
-              color: "#f8fafc",
-              padding: "1rem",
-              borderRadius: "6px",
-              maxHeight: "400px",
-              overflowY: "auto",
-            }}
-          >
-            {chatHistory.map((msg, idx) => (
-              <div
-                key={idx}
-                style={{
-                  marginBottom: "0.75rem",
-                  borderBottom: "1px solid #334155",
-                  paddingBottom: "0.5rem",
-                }}
-              >
-                <strong
-                  style={{
-                    color: msg.role === "user" ? "#38bdf8" : "#4ade80",
-                  }}
-                >
-                  {msg.role === "user" ? "User" : "KALKI"}:
-                </strong>{" "}
-                <span>{msg.content}</span>
-                <div
-                  style={{
-                    fontSize: "0.75rem",
-                    color: "#94a3b8",
-                    marginTop: "0.2rem",
-                  }}
-                >
-                  {msg.timestamp}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
+  return null;
 }
