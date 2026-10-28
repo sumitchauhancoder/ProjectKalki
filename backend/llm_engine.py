@@ -1,21 +1,23 @@
 import os
 import re
 import subprocess
-import pyautogui
+import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
+import pyautogui
 from google import genai
 from google.genai import types
 from groq import Groq
 
+# Load .env explicitly from the backend/ folder relative to this file
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
-api_key = os.getenv("GEMINI_API_KEY")
-client = genai.Client(api_key=api_key) if api_key and api_key.strip() != "" else None
-
-groq_api_key = os.getenv("GROQ_API_KEY")
-groq_client = Groq(api_key=groq_api_key) if groq_api_key and groq_api_key.strip() != "" else None
+# Model names change over time; verify against official documentation:
+# - Google Gemini: https://ai.google.dev/gemini-api/docs/models
+# - Groq: https://console.groq.com/docs/models
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"  # Verify in https://ai.google.dev/gemini-api/docs/models
+DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"  # Verify in https://console.groq.com/docs/models
 
 APP_MAP = {
     "calculator": "calc",
@@ -30,6 +32,33 @@ APP_MAP = {
     "chrome": "start chrome",
     "browser": "start https://google.com"
 }
+
+def get_gemini_client():
+    """Initializes Google GenAI client if GEMINI_API_KEY is available."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if api_key and api_key.strip():
+        try:
+            return genai.Client(
+                api_key=api_key.strip(),
+                http_options=types.HttpOptions(timeout=10000)
+            )
+        except Exception as e:
+            print(f"[LLM Engine] Could not initialize Gemini client: {type(e).__name__}")
+    return None
+
+def get_groq_client():
+    """Initializes Groq client if GROQ_API_KEY is available."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if api_key and api_key.strip():
+        try:
+            return Groq(api_key=api_key.strip(), timeout=10.0)
+        except Exception as e:
+            print(f"[LLM Engine] Could not initialize Groq client: {type(e).__name__}")
+    return None
+
+# Module-level client instances
+client = get_gemini_client()
+groq_client = get_groq_client()
 
 def launch_application(app_name: str) -> str:
     clean_name = app_name.lower().strip()
@@ -75,64 +104,110 @@ Rules:
 3. Provide direct answers to general knowledge questions.
 """
 
+def _call_gemini(user_prompt: str, chat_history: list = None) -> str:
+    """Executes call to Google GenAI Gemini model with a 10s deadline."""
+    active_client = client or get_gemini_client()
+    if not active_client:
+        raise ValueError("GEMINI_API_KEY missing or client unavailable")
+
+    model_name = os.getenv("GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL
+
+    formatted_contents = []
+    if chat_history:
+        for msg in chat_history:
+            role = "user" if msg.get("role") == "user" else "model"
+            formatted_contents.append(
+                types.Content(role=role, parts=[types.Part.from_text(text=msg.get("content", ""))])
+            )
+    formatted_contents.append(
+        types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)])
+    )
+
+    response = active_client.models.generate_content(
+        model=model_name,
+        contents=formatted_contents,
+        config=types.GenerateContentConfig(
+            system_instruction=JARVIS_SYSTEM_INSTRUCTION,
+            temperature=0.2,
+            http_options=types.HttpOptions(timeout=10000),
+        ),
+    )
+    if response and response.text:
+        return response.text.strip()
+    return "I processed your request, but received an empty response from Gemini."
+
+def _call_groq(user_prompt: str, chat_history: list = None) -> str:
+    """Executes fallback call to Groq API with 10s timeout."""
+    active_groq = groq_client or get_groq_client()
+    if not active_groq:
+        raise ValueError("GROQ_API_KEY missing or client unavailable")
+
+    model_name = os.getenv("GROQ_MODEL", "").strip() or DEFAULT_GROQ_MODEL
+
+    messages = [{"role": "system", "content": JARVIS_SYSTEM_INSTRUCTION}]
+    if chat_history:
+        for msg in chat_history:
+            messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+    messages.append({"role": "user", "content": user_prompt})
+
+    completion = active_groq.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=1024,
+        timeout=10.0,
+    )
+    if completion and completion.choices and len(completion.choices) > 0:
+        content = completion.choices[0].message.content
+        if content:
+            return content.strip()
+    return "I processed your request with Groq, but received an empty response."
+
 def process_jarvis_intent(user_prompt: str, chat_history: list = None) -> dict:
+    """
+    Core intent routing chain:
+    1. Local regex router (0ms local execution)
+    2. Primary Cloud LLM (Google Gemini with 10s timeout)
+    3. Fallback Cloud LLM (Groq if GEMINI fails and GROQ_API_KEY is configured)
+    4. Safe spoken error message (never crashes the request)
+    """
     # 1. 0ms Fast-Path Local Router
     handled, result = fast_path_local_router(user_prompt)
     if handled:
+        print("[LLM Engine] Provider: Local Regex Router")
         return result
 
-    # 2. Try Cloud Gemini LLM Core first
-    if client:
+    # 2. Primary: Google Gemini Cloud Core
+    try:
+        reply = _call_gemini(user_prompt, chat_history)
+        model_name = os.getenv("GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL
+        print(f"[LLM Engine] Provider: Gemini ({model_name})")
+        return {"reply": reply, "tool_executed": f"Gemini ({model_name})"}
+    except Exception as err:
+        # Never log API keys or secrets
+        print(f"[LLM Engine] Gemini call failed: {type(err).__name__}. Evaluating Groq fallback...")
+
+    # 3. Fallback: Groq Cloud Core (if GROQ_API_KEY is configured)
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key and groq_key.strip():
         try:
-            formatted_contents = []
-            if chat_history:
-                for msg in chat_history:
-                    role = "user" if msg["role"] == "user" else "model"
-                    formatted_contents.append(
-                        types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])])
-                    )
-            
-            formatted_contents.append(
-                types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)])
-            )
-
-            response = client.models.generate_content(
-                model='gemini-3.8-flash',
-                contents=formatted_contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=JARVIS_SYSTEM_INSTRUCTION,
-                    temperature=0.2,
-                ),
-            )
-            return {"reply": response.text.strip(), "tool_executed": "Gemini 3.8 Flash Core"}
-        except Exception as err:
-            print(f"[Gemini API Limit/Error]: {str(err)} -> Falling back to Groq Llama 3.3")
-
-    # 3. Fallback to Groq Llama 3.3 if Gemini fails or hits quota limits
-    # 3. Fallback to Groq if Gemini fails or hits quota limits
-    if groq_client:
-        try:
-            messages = [{"role": "system", "content": JARVIS_SYSTEM_INSTRUCTION}]
-            if chat_history:
-                for msg in chat_history:
-                    messages.append({"role": msg["role"], "content": msg["content"]})
-            messages.append({"role": "user", "content": user_prompt})
-
-            completion = groq_client.chat.completions.create(
-                model="openai/gpt-oss-120b",
-                messages=messages,
-                temperature=0.2,
-                max_tokens=1024,
-            )
-            reply_text = completion.choices[0].message.content.strip()
-            return {"reply": reply_text, "tool_executed": "Groq GPT-OSS 120B Fallback Core"}
+            reply = _call_groq(user_prompt, chat_history)
+            model_name = os.getenv("GROQ_MODEL", "").strip() or DEFAULT_GROQ_MODEL
+            print(f"[LLM Engine] Provider: Groq ({model_name}) [Fallback]")
+            return {"reply": reply, "tool_executed": f"Groq ({model_name}) Fallback"}
         except Exception as groq_err:
-            print(f"[Groq API Error]: {str(groq_err)}")
-            return {"reply": f"All Cloud Core Failovers Failed: {str(groq_err)}", "tool_executed": None}
+            # Never log API keys or secrets
+            print(f"[LLM Engine] Groq fallback failed: {type(groq_err).__name__}")
+
+    # 4. Graceful spoken error fallback (Never crash the request)
     return {
-        "reply": "Both GEMINI_API_KEY and GROQ_API_KEY are missing or exhausted in backend/.env.",
+        "reply": "I am having trouble connecting to cloud services right now. Please check your internet connection or API keys.",
         "tool_executed": None
     }
+
+async def process_jarvis_intent_async(user_prompt: str, chat_history: list = None) -> dict:
+    """Non-blocking async wrapper that offloads blocking SDK calls to a worker thread."""
+    return await asyncio.to_thread(process_jarvis_intent, user_prompt, chat_history)
 
 def click_at_coordinates(x: int, y: int) -> str:
     """Clicks directly on desktop screen coordinates (x, y)."""

@@ -1,20 +1,28 @@
+import sys
+from pathlib import Path
+
+# Ensure backend directory is in sys.path
+backend_dir = Path(__file__).resolve().parent
+if str(backend_dir) not in sys.path:
+    sys.path.insert(0, str(backend_dir))
+
 import asyncio
+import base64
+import cv2
+import io
 import json
+import numpy as np
+from typing import Dict, Any, Optional
+import pyautogui
+import sounddevice as sd
+import speech_recognition as sr
+import subprocess
+import uvicorn
+import wave
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from typing import Dict, Any
-import uvicorn
-import cv2
-import numpy as np
-import base64
-import sounddevice as sd
-import speech_recognition as sr
-import wave
-import io
-import subprocess
-import pyautogui
 
 from database import Base, engine, get_db
 import models
@@ -22,10 +30,8 @@ from llm_engine import process_jarvis_intent, click_bounding_box, click_at_coord
 from tts_engine import speak_text
 from auth import auth_router
 
-# 1. Initialize FastAPI app first
 app = FastAPI(title="KALKI Core Engine", version="1.0.0")
 
-# 2. Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,9 +40,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 3. Include Auth Router and create database tables
 app.include_router(auth_router)
-Base.metadata.create_all(bind=engine)
+
+# Safe database initialization: do not crash on startup if DB is offline
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception as e:
+    print(f"[Database Warning] Table initialization skipped: {type(e).__name__}")
 
 recognizer = sr.Recognizer()
 
@@ -49,7 +59,7 @@ class FramePayload(BaseModel):
 class MacroCreatePayload(BaseModel):
     trigger_phrase: str
     action_type: str
-    action_payload: Dict[str, Any]
+    action_payload: str
 
 class VisualClickPayload(BaseModel):
     box_index: int
@@ -57,20 +67,23 @@ class VisualClickPayload(BaseModel):
 
 def execute_macro_action(macro: models.VoiceMacro) -> str:
     action_type = macro.action_type
-    payload = macro.action_payload
+    try:
+        payload = json.loads(macro.action_payload) if isinstance(macro.action_payload, str) else macro.action_payload
+    except Exception:
+        payload = {"path": macro.action_payload, "keys": [macro.action_payload], "text": macro.action_payload}
 
     if action_type == "launch_app":
-        app_path = payload.get("path")
+        app_path = payload.get("path") if isinstance(payload, dict) else str(payload)
         if app_path:
             subprocess.Popen(app_path, shell=True)
             return f"Launched process: {app_path}"
     elif action_type == "hotkey":
-        keys = payload.get("keys", [])
+        keys = payload.get("keys", []) if isinstance(payload, dict) else [str(payload)]
         if keys:
             pyautogui.hotkey(*keys)
             return f"Executed hotkey: {'+'.join(keys)}"
     elif action_type == "type_text":
-        text = payload.get("text", "")
+        text = payload.get("text", "") if isinstance(payload, dict) else str(payload)
         if text:
             pyautogui.write(text, interval=0.01)
             return f"Typed text: {text.strip()}"
@@ -81,77 +94,84 @@ def health_check():
     return {"status": "online", "system": "KALKI Jarvis Core Engine"}
 
 @app.post("/execute-command")
-async def run_command(payload: CommandPayload, db: Session = Depends(get_db)):
-    try:
-        cmd = payload.command.strip()
-        if not cmd:
-            raise HTTPException(status_code=400, detail="Empty command input")
+async def run_command(payload: CommandPayload, db: Optional[Session] = Depends(get_db)):
+    cmd = payload.command.strip()
+    if not cmd:
+        raise HTTPException(status_code=400, detail="Empty command input")
 
-        active_session = db.query(models.ChatSession).filter(models.ChatSession.id == 1).first()
-        if not active_session:
-            active_session = models.ChatSession(id=1, session_title="KALKI Core Session")
-            db.add(active_session)
+    history_context = []
+    matched_macro = None
+
+    # Database read operations are safe; if DB is unreachable, continue gracefully
+    if db is not None:
+        try:
+            active_session = db.query(models.ChatSession).filter(models.ChatSession.id == 1).first()
+            if not active_session:
+                active_session = models.ChatSession(id=1, session_title="KALKI Core Session")
+                db.add(active_session)
+                db.commit()
+
+            past_messages = db.query(models.ChatMessage).filter(
+                models.ChatMessage.session_id == 1
+            ).order_by(models.ChatMessage.timestamp.asc()).all()
+            history_context = [{"role": m.role, "content": m.content} for m in past_messages[-10:]]
+
+            user_msg_db = models.ChatMessage(session_id=1, role="user", content=cmd)
+            db.add(user_msg_db)
             db.commit()
 
-        past_messages = db.query(models.ChatMessage).filter(
-            models.ChatMessage.session_id == 1
-        ).order_by(models.ChatMessage.timestamp.asc()).all()
-        
-        history_context = [{"role": m.role, "content": m.content} for m in past_messages[-10:]]
+            matched_macro = db.query(models.VoiceMacro).filter(
+                models.VoiceMacro.trigger_phrase == cmd.lower()
+            ).first()
+        except Exception as db_err:
+            print(f"[Database Warning]: Failed query in /execute-command: {type(db_err).__name__}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
-        user_msg_db = models.ChatMessage(session_id=1, role="user", content=cmd)
-        db.add(user_msg_db)
-        db.commit()
+    if matched_macro:
+        executed_info = execute_macro_action(matched_macro)
+        reply_message = f"Executing stored macro '{matched_macro.trigger_phrase}'"
+    else:
+        # Offload blocking LLM SDK calls to a background thread
+        llm_res = await asyncio.to_thread(process_jarvis_intent, cmd, chat_history=history_context)
+        reply_message = llm_res.get("reply", "Command completed.")
+        executed_info = llm_res.get("tool_executed")
 
-        executed_info = None
-        reply_message = ""
-
-        matched_macro = db.query(models.VoiceMacro).filter(
-            models.VoiceMacro.trigger_phrase == cmd.lower()
-        ).first()
-
-        if matched_macro:
-            executed_info = execute_macro_action(matched_macro)
-            reply_message = f"Executing stored macro '{matched_macro.trigger_phrase}'"
-        else:
-            llm_res = process_jarvis_intent(cmd, chat_history=history_context)
-            reply_message = llm_res.get("reply", "Command completed.")
-            executed_info = llm_res.get("tool_executed")
-
-        assistant_msg_db = models.ChatMessage(session_id=1, role="assistant", content=reply_message)
-        db.add(assistant_msg_db)
-        db.commit()
-
+    # Database write operations
+    if db is not None:
         try:
-            asyncio.create_task(speak_text(reply_message))
-        except Exception as tts_err:
-            print(f"[TTS Background Error]: {tts_err}")
+            assistant_msg_db = models.ChatMessage(session_id=1, role="assistant", content=reply_message)
+            db.add(assistant_msg_db)
+            log_entry = models.AuditLog(
+                command_input=cmd,
+                execution_status="success" if executed_info else "reasoned",
+                telemetry_data=json.dumps({"response": reply_message, "executed": executed_info})
+            )
+            db.add(log_entry)
+            db.commit()
+        except Exception as db_err:
+            print(f"[Database Warning]: Failed commit in /execute-command: {type(db_err).__name__}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
-        log_entry = models.AuditLog(
-            command_input=cmd,
-            execution_status="success" if executed_info else "reasoned",
-            telemetry_data=json.dumps({"response": reply_message, "executed": executed_info})
-        )
-        db.add(log_entry)
-        db.commit()
+    # Non-blocking background TTS
+    try:
+        asyncio.create_task(speak_text(reply_message))
+    except Exception as tts_err:
+        print(f"[TTS Background Error]: {tts_err}")
 
-        return {
-            "status": "success",
-            "reply": reply_message,
-            "executed": executed_info or "Command processed"
-        }
-
-    except Exception as e:
-        db.rollback()
-        print(f"[Execution Error]: {str(e)}")
-        return {
-            "status": "error",
-            "reply": f"Core Error: {str(e)}",
-            "executed": None
-        }
+    return {
+        "status": "success",
+        "reply": reply_message,
+        "executed": executed_info or "Command processed"
+    }
 
 @app.post("/listen-voice")
-async def listen_voice(db: Session = Depends(get_db)):
+async def listen_voice(db: Optional[Session] = Depends(get_db)):
     try:
         sample_rate = 16000
         duration = 4
@@ -174,27 +194,36 @@ async def listen_voice(db: Session = Depends(get_db)):
             except Exception:
                 transcript = recognizer.recognize_google(audio_data, language="en-IN").strip()
 
-        matched_macro = db.query(models.VoiceMacro).filter(
-            models.VoiceMacro.trigger_phrase == transcript.lower()
-        ).first()
+        matched_macro = None
+        if db is not None:
+            try:
+                matched_macro = db.query(models.VoiceMacro).filter(
+                    models.VoiceMacro.trigger_phrase == transcript.lower()
+                ).first()
+            except Exception as db_err:
+                print(f"[Database Warning]: {db_err}")
 
         if matched_macro:
             executed_info = execute_macro_action(matched_macro)
             reply_message = f"Executing macro '{matched_macro.trigger_phrase}'"
         else:
-            llm_res = process_jarvis_intent(transcript)
+            llm_res = await asyncio.to_thread(process_jarvis_intent, transcript)
             reply_message = llm_res.get("reply", "Speech processed.")
             executed_info = llm_res.get("tool_executed")
 
         asyncio.create_task(speak_text(reply_message))
 
-        log_entry = models.AuditLog(
-            command_input=transcript,
-            execution_status="success" if executed_info else "reasoned",
-            telemetry_data=json.dumps({"response": reply_message, "executed": executed_info})
-        )
-        db.add(log_entry)
-        db.commit()
+        if db is not None:
+            try:
+                log_entry = models.AuditLog(
+                    command_input=transcript,
+                    execution_status="success" if executed_info else "reasoned",
+                    telemetry_data=json.dumps({"response": reply_message, "executed": executed_info})
+                )
+                db.add(log_entry)
+                db.commit()
+            except Exception as db_err:
+                print(f"[Database Warning]: {db_err}")
 
         return {
             "status": "success",
@@ -211,45 +240,67 @@ async def listen_voice(db: Session = Depends(get_db)):
         return {"status": "error", "transcript": "", "reply": str(e), "executed": None}
 
 @app.post("/macros")
-def create_macro(payload: MacroCreatePayload, db: Session = Depends(get_db)):
-    existing = db.query(models.VoiceMacro).filter(
-        models.VoiceMacro.trigger_phrase == payload.trigger_phrase.lower()
-    ).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Trigger phrase already exists.")
+def create_macro(payload: MacroCreatePayload, db: Optional[Session] = Depends(get_db)):
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database is currently unavailable.")
+    try:
+        existing = db.query(models.VoiceMacro).filter(
+            models.VoiceMacro.trigger_phrase == payload.trigger_phrase.lower()
+        ).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Trigger phrase already exists.")
 
-    new_macro = models.VoiceMacro(
-        trigger_phrase=payload.trigger_phrase.lower(),
-        action_type=payload.action_type,
-        action_payload=payload.action_payload
-    )
-    db.add(new_macro)
-    db.commit()
-    db.refresh(new_macro)
-    return {"status": "success", "trigger": new_macro.trigger_phrase, "macro_id": new_macro.id}
+        new_macro = models.VoiceMacro(
+            trigger_phrase=payload.trigger_phrase.lower(),
+            action_type=payload.action_type,
+            action_payload=payload.action_payload
+        )
+        db.add(new_macro)
+        db.commit()
+        db.refresh(new_macro)
+        return {"status": "success", "trigger": new_macro.trigger_phrase, "macro_id": new_macro.id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
 
 @app.get("/macros")
-def list_macros(db: Session = Depends(get_db)):
-    return db.query(models.VoiceMacro).all()
+def list_macros(db: Optional[Session] = Depends(get_db)):
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database is currently unavailable.")
+    try:
+        return db.query(models.VoiceMacro).all()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
 
 @app.get("/audit-logs")
-def get_audit_logs(limit: int = 15, db: Session = Depends(get_db)):
-    logs = db.query(models.AuditLog).order_by(models.AuditLog.timestamp.desc()).limit(limit).all()
-    return [
-        {
-            "id": log.id,
-            "command_input": log.command_input,
-            "execution_status": log.execution_status,
-            "telemetry_data": log.telemetry_data,
-            "timestamp": log.timestamp.isoformat()
-        }
-        for log in logs
-    ]
+def get_audit_logs(limit: int = 15, db: Optional[Session] = Depends(get_db)):
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database is currently unavailable.")
+    try:
+        logs = db.query(models.AuditLog).order_by(models.AuditLog.timestamp.desc()).limit(limit).all()
+        return [
+            {
+                "id": log.id,
+                "command_input": log.command_input,
+                "execution_status": log.execution_status,
+                "telemetry_data": log.telemetry_data,
+                "timestamp": log.timestamp.isoformat()
+            }
+            for log in logs
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
 
 @app.get("/chat-history")
-def get_chat_history(db: Session = Depends(get_db)):
-    messages = db.query(models.ChatMessage).filter(models.ChatMessage.session_id == 1).order_by(models.ChatMessage.timestamp.asc()).all()
-    return [{"role": m.role, "content": m.content, "timestamp": m.timestamp.isoformat()} for m in messages]
+def get_chat_history(db: Optional[Session] = Depends(get_db)):
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database is currently unavailable.")
+    try:
+        messages = db.query(models.ChatMessage).filter(models.ChatMessage.session_id == 1).order_by(models.ChatMessage.timestamp.asc()).all()
+        return [{"role": m.role, "content": m.content, "timestamp": m.timestamp.isoformat()} for m in messages]
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
 
 @app.post("/process-frame")
 async def process_frame(payload: FramePayload):
@@ -299,18 +350,22 @@ async def process_frame(payload: FramePayload):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/visual-click")
-async def visual_click(payload: VisualClickPayload, db: Session = Depends(get_db)):
+async def visual_click(payload: VisualClickPayload, db: Optional[Session] = Depends(get_db)):
     try:
         result_msg = click_bounding_box(payload.box_index, payload.bounding_boxes)
         asyncio.create_task(speak_text(result_msg))
 
-        log_entry = models.AuditLog(
-            command_input=f"Visual Click Box #{payload.box_index}",
-            execution_status="success",
-            telemetry_data=json.dumps({"action": "visual_click", "result": result_msg})
-        )
-        db.add(log_entry)
-        db.commit()
+        if db is not None:
+            try:
+                log_entry = models.AuditLog(
+                    command_input=f"Visual Click Box #{payload.box_index}",
+                    execution_status="success",
+                    telemetry_data=json.dumps({"action": "visual_click", "result": result_msg})
+                )
+                db.add(log_entry)
+                db.commit()
+            except Exception as db_err:
+                print(f"[Database Warning]: {db_err}")
 
         return {"status": "success", "reply": result_msg}
     except Exception as e:
