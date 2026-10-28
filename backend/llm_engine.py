@@ -16,8 +16,8 @@ load_dotenv(dotenv_path=env_path)
 # Model names change over time; verify against official documentation:
 # - Google Gemini: https://ai.google.dev/gemini-api/docs/models
 # - Groq: https://console.groq.com/docs/models
-DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"  # Verify in https://ai.google.dev/gemini-api/docs/models
-DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"  # Verify in https://console.groq.com/docs/models
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"  # Verify in https://ai.google.dev/gemini-api/docs/models
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"  # Verify in https://console.groq.com/docs/models
 
 APP_MAP = {
     "calculator": "calc",
@@ -163,12 +163,18 @@ def _call_groq(user_prompt: str, chat_history: list = None) -> str:
             return content.strip()
     return "I processed your request with Groq, but received an empty response."
 
+def _format_error_log(provider: str, err: Exception) -> str:
+    """Format safe provider failure log without exposing secrets, request bodies, or error payloads."""
+    status = getattr(err, "status_code", getattr(err, "code", getattr(err, "http_status", None)))
+    status_str = f" status={status}" if status is not None else ""
+    return f"[LLM] {provider} failed: {type(err).__name__}{status_str}"
+
 def process_jarvis_intent(user_prompt: str, chat_history: list = None) -> dict:
     """
     Core intent routing chain:
     1. Local regex router (0ms local execution)
-    2. Primary Cloud LLM (Google Gemini with 10s timeout)
-    3. Fallback Cloud LLM (Groq if GEMINI fails and GROQ_API_KEY is configured)
+    2. Primary Cloud LLM (Groq with 10s timeout)
+    3. Fallback Cloud LLM (Google Gemini with 10s timeout)
     4. Safe spoken error message (never crashes the request)
     """
     # 1. 0ms Fast-Path Local Router
@@ -177,27 +183,33 @@ def process_jarvis_intent(user_prompt: str, chat_history: list = None) -> dict:
         print("[LLM Engine] Provider: Local Regex Router")
         return result
 
-    # 2. Primary: Google Gemini Cloud Core
-    try:
-        reply = _call_gemini(user_prompt, chat_history)
-        model_name = os.getenv("GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL
-        print(f"[LLM Engine] Provider: Gemini ({model_name})")
-        return {"reply": reply, "tool_executed": f"Gemini ({model_name})"}
-    except Exception as err:
-        # Never log API keys or secrets
-        print(f"[LLM Engine] Gemini call failed: {type(err).__name__}. Evaluating Groq fallback...")
-
-    # 3. Fallback: Groq Cloud Core (if GROQ_API_KEY is configured)
+    # 2. Primary: Groq Cloud Core (10s timeout)
     groq_key = os.getenv("GROQ_API_KEY")
     if groq_key and groq_key.strip():
         try:
             reply = _call_groq(user_prompt, chat_history)
             model_name = os.getenv("GROQ_MODEL", "").strip() or DEFAULT_GROQ_MODEL
-            print(f"[LLM Engine] Provider: Groq ({model_name}) [Fallback]")
-            return {"reply": reply, "tool_executed": f"Groq ({model_name}) Fallback"}
+            print(f"[LLM Engine] Provider: Groq ({model_name})")
+            return {"reply": reply, "tool_executed": f"Groq ({model_name})"}
         except Exception as groq_err:
             # Never log API keys or secrets
-            print(f"[LLM Engine] Groq fallback failed: {type(groq_err).__name__}")
+            print(_format_error_log("groq", groq_err))
+    else:
+        print("[LLM] groq failed: ValueError status=missing_key")
+
+    # 3. Fallback: Google Gemini Cloud Core (10s timeout)
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if gemini_key and gemini_key.strip():
+        try:
+            reply = _call_gemini(user_prompt, chat_history)
+            model_name = os.getenv("GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL
+            print(f"[LLM Engine] Provider: Gemini ({model_name}) [Fallback]")
+            return {"reply": reply, "tool_executed": f"Gemini ({model_name}) Fallback"}
+        except Exception as gemini_err:
+            # Never log API keys or secrets
+            print(_format_error_log("gemini", gemini_err))
+    else:
+        print("[LLM] gemini failed: ValueError status=missing_key")
 
     # 4. Graceful spoken error fallback (Never crash the request)
     return {

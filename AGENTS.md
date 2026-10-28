@@ -22,8 +22,8 @@
 │   /voice/start /voice/stop /voice/status                │
 │                                                         │
 │  LLM chain:  local regex router                         │
-│              → Gemini (10 s timeout)                    │
-│              → Groq (fallback)                          │
+│              → Groq (10 s timeout)                      │
+│              → Gemini (fallback)                        │
 │              → safe spoken error message                │
 │                                                         │
 │  Voice:  openWakeWord → faster-whisper → LLM → edge-tts │
@@ -53,13 +53,15 @@
 3. **Every external service is optional with a graceful fallback:** The app must start and run if PostgreSQL is offline, if the internet is disconnected, or if API keys are missing.
 4. **All services must be free-tier or local:** Project KALKI is budget-free; no paid libraries or paid service tiers are allowed.
 5. **The LLM chain is strictly ordered:**
-   `Local Regex Router (0ms)` &rarr; `Gemini (10s timeout)` &rarr; `Groq (fallback)` &rarr; `Safe spoken error message`.
+   `Local Regex Router (0ms)` &rarr; `Groq (openai/gpt-oss-120b, 10s timeout)` &rarr; `Gemini (gemini-2.5-flash fallback)` &rarr; `Safe spoken error message`.
 6. **Authentication and Data roles are separated:** Firebase handles user authentication. PostgreSQL (or local SQLite) stores application data. Firestore is not used.
 7. **The installer must never contain database credentials, the Firebase service account, or any API key:** Each user brings their own free Gemini key, stored securely using Electron `safeStorage`.
 
 ---
 
 ## 3. How to Run
+
+Before starting, make sure no old backend is on port 8000. Stop the dev session with Ctrl+C.
 
 ### Run Backend Server (FastAPI)
 From repository root using the virtual environment:

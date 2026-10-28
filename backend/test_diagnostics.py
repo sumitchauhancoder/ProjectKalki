@@ -52,24 +52,50 @@ def run_all_checks():
         all_passed = False
 
     # --------------------------------------------------------------------------
-    # Check 3: When the Gemini call fails, the Groq fallback is used (Mocked)
+    # Check 3: Groq Primary & Gemini Fallback Chain (Mocked, 0 Network Calls)
     # --------------------------------------------------------------------------
-    print("\n[Check 3] Gemini Failure Triggers Groq Fallback (Mocked, 0 Network Calls):")
+    print("\n[Check 3] LLM Chain: Groq Primary, Gemini Fallback, and Safe Fallback:")
     try:
-        mock_groq_reply = "This is a safe fallback response from Groq Llama 3.3."
-        
-        with patch.object(llm_engine, "_call_gemini", side_effect=Exception("Gemini 429 Quota Exceeded")), \
-             patch.object(llm_engine, "_call_groq", return_value=mock_groq_reply) as mock_groq_call, \
-             patch.dict(os.environ, {"GROQ_API_KEY": "dummy_groq_key_for_test"}):
-            
-            result = llm_engine.process_jarvis_intent("What is the speed of light?")
-            
-            assert mock_groq_call.called, "Expected _call_groq to be called after Gemini failure"
-            assert result.get("reply") == mock_groq_reply, f"Unexpected reply: {result.get('reply')}"
-            assert "Groq" in result.get("tool_executed", ""), f"Tool executed does not indicate Groq: {result.get('tool_executed')}"
-            
-        print("  Simulated Gemini 429 quota failure -> Successfully routed to Groq fallback")
-        print(f"  Returned: '{result.get('reply')}' (tool: {result.get('tool_executed')})")
+        import groq
+        import httpx
+
+        # 3a. Groq success returns Groq's answer and never calls Gemini
+        with patch.object(llm_engine, "_call_groq", return_value="Paris is the capital of France.") as mock_groq, \
+             patch.object(llm_engine, "_call_gemini") as mock_gemini, \
+             patch.dict(os.environ, {"GROQ_API_KEY": "dummy_groq_key", "GEMINI_API_KEY": "dummy_gemini_key"}):
+
+            res1 = llm_engine.process_jarvis_intent("What is the capital of France?")
+            assert mock_groq.called, "Groq was not called as primary LLM"
+            assert not mock_gemini.called, "Gemini was called even though Groq succeeded!"
+            assert res1.get("reply") == "Paris is the capital of France."
+            assert "Groq" in res1.get("tool_executed", "")
+        print("  Case 3a: Groq primary answered successfully; Gemini was not called.")
+
+        # 3b. Groq failure (mocked 429) falls back to Gemini and returns Gemini's answer
+        dummy_req = httpx.Request("POST", "http://test")
+        dummy_resp = httpx.Response(status_code=429, request=dummy_req)
+        mock_groq_429 = groq.RateLimitError("Rate limit exceeded", response=dummy_resp, body=None)
+
+        with patch.object(llm_engine, "_call_groq", side_effect=mock_groq_429) as mock_groq, \
+             patch.object(llm_engine, "_call_gemini", return_value="Gemini fallback: 299,792 km/s") as mock_gemini, \
+             patch.dict(os.environ, {"GROQ_API_KEY": "dummy_groq_key", "GEMINI_API_KEY": "dummy_gemini_key"}):
+
+            res2 = llm_engine.process_jarvis_intent("What is the speed of light?")
+            assert mock_groq.called, "Groq was not called first"
+            assert mock_gemini.called, "Gemini fallback was not called after Groq 429 failure"
+            assert res2.get("reply") == "Gemini fallback: 299,792 km/s"
+            assert "Gemini" in res2.get("tool_executed", "")
+        print("  Case 3b: Groq 429 failure cleanly triggered Gemini fallback.")
+
+        # 3c. Both failing returns safe spoken error message
+        with patch.object(llm_engine, "_call_groq", side_effect=Exception("Groq offline")), \
+             patch.object(llm_engine, "_call_gemini", side_effect=Exception("Gemini quota 0")), \
+             patch.dict(os.environ, {"GROQ_API_KEY": "dummy_groq_key", "GEMINI_API_KEY": "dummy_gemini_key"}):
+
+            res3 = llm_engine.process_jarvis_intent("Query that fails everywhere")
+            assert "trouble connecting to cloud services" in res3.get("reply", "")
+            assert res3.get("tool_executed") is None
+        print("  Case 3c: Both providers failing returned safe spoken error message.")
         print("  PASS")
     except Exception as e:
         print(f"  FAIL — {e}")
@@ -133,11 +159,122 @@ def run_all_checks():
         all_passed = False
 
     # --------------------------------------------------------------------------
+    # Check 6: Unique TTS file names (two calls produce two different paths)
+    # --------------------------------------------------------------------------
+    print("\n[Check 6] Unique TTS File Names:")
+    try:
+        from tts_engine import get_unique_tts_path
+        path_1 = get_unique_tts_path()
+        path_2 = get_unique_tts_path()
+        assert path_1 != path_2, f"Expected unique paths, got identical: {path_1}"
+        assert str(path_1).endswith(".mp3"), f"Expected .mp3 extension: {path_1}"
+        assert str(path_2).endswith(".mp3"), f"Expected .mp3 extension: {path_2}"
+        print(f"  Generated Path 1: {path_1.name}")
+        print(f"  Generated Path 2: {path_2.name}")
+        print("  PASS")
+    except Exception as e:
+        print(f"  FAIL — {e}")
+        all_passed = False
+
+    # --------------------------------------------------------------------------
+    # Check 7: TTS Queue Ordering (Three queued items play in order)
+    # --------------------------------------------------------------------------
+    print("\n[Check 7] TTS Queue FIFO Ordering:")
+    try:
+        import asyncio
+        import tts_engine
+
+        async def _test_tts_queue():
+            played_items = []
+
+            async def mock_player(job_text):
+                played_items.append(job_text)
+
+            orig_hook = tts_engine.playback_hook
+            tts_engine.playback_hook = mock_player
+            try:
+                q = tts_engine.get_tts_queue()
+                await tts_engine.enqueue_speech("Item Alpha")
+                await tts_engine.enqueue_speech("Item Beta")
+                await tts_engine.enqueue_speech("Item Gamma")
+                await q.join()
+                assert played_items == ["Item Alpha", "Item Beta", "Item Gamma"], (
+                    f"Queue order mismatch: {played_items}"
+                )
+            finally:
+                tts_engine.playback_hook = orig_hook
+            return played_items
+
+        results = asyncio.run(_test_tts_queue())
+        print(f"  Queued items played in strict order: {results}")
+        print("  PASS")
+    except Exception as e:
+        print(f"  FAIL — {e}")
+        all_passed = False
+
+    # --------------------------------------------------------------------------
+    # Check 8: Vision routes do not enqueue speech
+    # --------------------------------------------------------------------------
+    print("\n[Check 8] Vision Routes Do Not Enqueue Speech:")
+    try:
+        from fastapi.testclient import TestClient
+        import tts_engine
+
+        client = TestClient(app, raise_server_exceptions=False)
+        with patch.object(tts_engine, "speak_text") as mock_speak, \
+             patch("app.speak_text") as mock_app_speak:
+
+            # 1. /process-frame
+            dummy_img = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            r1 = client.post("/process-frame", json={"image_base64": dummy_img})
+            assert r1.status_code == 200, f"/process-frame failed: {r1.status_code}"
+            assert not mock_speak.called and not mock_app_speak.called, "speak_text called from /process-frame!"
+
+            # 2. /visual-click
+            with patch("app.click_bounding_box", return_value="Clicked UI Box"):
+                r2 = client.post("/visual-click", json={"box_index": 0, "bounding_boxes": [{"x": 10, "y": 10, "w": 20, "h": 20}]})
+                assert r2.status_code == 200, f"/visual-click failed: {r2.status_code}"
+                assert not mock_speak.called and not mock_app_speak.called, "speak_text called from /visual-click!"
+
+        print("  Verified: Neither /process-frame nor /visual-click enqueued speech")
+        print("  PASS")
+    except Exception as e:
+        print(f"  FAIL — {e}")
+        all_passed = False
+
+    # --------------------------------------------------------------------------
+    # Check 9: Safe Error Logging on Gemini Failure
+    # --------------------------------------------------------------------------
+    print("\n[Check 9] Safe Error Logging on Gemini Failure:")
+    try:
+        from google.genai.errors import ClientError
+        from io import StringIO
+
+        fake_secret = "AIzaSySuperSecretApiKeyShouldNeverBeLogged"
+        mock_err = ClientError(429, f"Quota exceeded with token {fake_secret}")
+
+        captured = StringIO()
+        with patch("sys.stdout", captured), \
+             patch.object(llm_engine, "_call_gemini", side_effect=mock_err), \
+             patch.dict(os.environ, {"GROQ_API_KEY": ""}):
+            llm_engine.process_jarvis_intent("What is the weather today?")
+
+        out = captured.getvalue()
+        assert "[LLM] gemini failed: ClientError status=429" in out, f"Expected formatted error log not found: {out}"
+        assert fake_secret not in out, "Leaked secret key into log output!"
+        print("  [LLM] gemini failed: ClientError status=429 logged successfully")
+        print("  Verified: Secret key was NOT in log output")
+        print("  PASS")
+    except Exception as e:
+        print(f"  FAIL — {e}")
+        all_passed = False
+
+    # --------------------------------------------------------------------------
     # Summary
     # --------------------------------------------------------------------------
     print("\n" + "=" * 70)
     if all_passed:
-        print("ALL 5 PHASE 0 CHECKS PASSED [PASS]")
+        print("ALL 9 DIAGNOSTICS & SAFETY CHECKS PASSED [PASS]")
         print("=" * 70)
         sys.exit(0)
     else:

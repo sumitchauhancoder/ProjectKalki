@@ -26,6 +26,7 @@ out/
 
 # Audio & Media
 *.mp3
+backend/tts_cache/
 
 # Logs
 *.log

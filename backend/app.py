@@ -364,7 +364,6 @@ async def process_frame(payload: FramePayload):
 async def visual_click(payload: VisualClickPayload, db: Optional[Session] = Depends(get_db)):
     try:
         result_msg = click_bounding_box(payload.box_index, payload.bounding_boxes)
-        asyncio.create_task(speak_text(result_msg))
 
         if db is not None:
             try:

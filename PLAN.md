@@ -85,8 +85,8 @@ Keep them in `.env` (`GEMINI_MODEL`, `GROQ_MODEL`), never hardcoded. The name `g
 │   /voice/start /voice/stop /voice/status                │
 │                                                         │
 │  LLM chain:  local regex router                         │
-│              → Gemini (10 s timeout)                    │
-│              → Groq (fallback)                          │
+│              → Groq (10 s timeout)                      │
+│              → Gemini (fallback)                        │
 │              → safe spoken error message                │
 │                                                         │
 │  Voice:  openWakeWord → faster-whisper → LLM → edge-tts │
@@ -113,7 +113,7 @@ Keep them in `.env` (`GEMINI_MODEL`, `GROQ_MODEL`), never hardcoded. The name `g
 2. Never hardcode or log secrets. Never print partial keys.
 3. Every external service is optional and has a graceful fallback.
 4. All services must be free-tier or local.
-5. LLM chain order is fixed: local router → Gemini → Groq → safe error message.
+5. LLM chain order is fixed: local router → Groq → Gemini → safe error message.
 6. Firebase handles authentication. Postgres stores app data.
 7. The installer must never contain database credentials, the Firebase service account, or any API key.
 
