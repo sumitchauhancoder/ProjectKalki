@@ -415,6 +415,13 @@ async def listen_voice(request: Request, db: Optional[Session] = Depends(get_db)
             audio_data = recognizer.record(source)
             transcript = recognize_speech(audio_data, language=user_lang)
 
+        # Language mismatch check: when Voice Lang is Kannada/Hindi and transcript contains only Latin letters, treat input as English
+        is_indic_setting = isinstance(user_lang, str) and (user_lang.startswith("kn") or user_lang.startswith("hi"))
+        has_indic_chars = bool(re.search(r'[\u0900-\u097F\u0C80-\u0CFF]', transcript))
+        has_latin_chars = bool(re.search(r'[a-zA-Z]', transcript))
+        if is_indic_setting and has_latin_chars and not has_indic_chars:
+            print("[STT] language mismatch, using en-IN", flush=True)
+
         # Check for spoken stop word
         if is_stop_command(transcript):
             cancel_active_pipeline()

@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -580,11 +581,263 @@ def run_all_checks():
         all_passed = False
 
     # --------------------------------------------------------------------------
+    # Check 14: Speech Cleanliness, Sentence Splitter Merging, and Stop Words
+    # --------------------------------------------------------------------------
+    print("\n[Check 14] Speech Cleanliness, Sentence Splitter Merging, and Stop Words:")
+    try:
+        from tts_engine import clean_for_speech, detect_language, VOICE_MAP
+        from sentence_splitter import SentenceSplitter
+
+        # 14a. clean_for_speech test cases (Indic conjuncts and vowel signs survive intact)
+        assert clean_for_speech("**Paris.**") == "Paris."
+        assert clean_for_speech("→ Open Notepad") == "Open Notepad"
+        assert clean_for_speech("`notepad`") == "notepad"
+        assert clean_for_speech("1. Step one") == "Step one"
+        assert clean_for_speech("**ನಮಸ್ಕಾರ** ಗೆಳೆಯರೇ") == "ನಮಸ್ಕಾರ ಗೆಳೆಯರೇ"
+        assert clean_for_speech("ನಮಸ್ಕಾರ") == "ನಮಸ್ಕಾರ", "Kannada conjuncts/matras stripped!"
+        assert clean_for_speech("नमस्ते") == "नमस्ते", "Devanagari conjuncts/matras stripped!"
+        assert clean_for_speech("ಕನ್ನಡ") == "ಕನ್ನಡ"
+        assert clean_for_speech("हिंदी") == "हिंदी"
+        assert clean_for_speech("Growth is 100%!!") == "Growth is 100 percent!"
+        assert clean_for_speech("Check [here](http://example.com) 👍 → 🚀") == "Check here"
+        print("  14a. clean_for_speech strips markdown/arrows/emojis while 100% preserving Indic conjuncts & vowel signs.")
+
+        # 14b. detect_language dominant script and foreign script safety
+        assert detect_language("This is English.") == VOICE_MAP["english_in"]
+        assert detect_language("यह हिंदी में उत्तर है।") == VOICE_MAP["hindi"]
+        assert detect_language("ಇದು ಕನ್ನಡದಲ್ಲಿ ಉತ್ತರವಾಗಿದೆ.") == VOICE_MAP["kannada"]
+        # Chinese / foreign text must NEVER select a Kannada or Hindi voice
+        assert detect_language("你好，世界！") == VOICE_MAP["english_in"], "Chinese text incorrectly selected Indic voice!"
+        assert detect_language("这是中文回复") == VOICE_MAP["english_in"], "Chinese text incorrectly selected Indic voice!"
+        # Dominant script with single quote/word should pick majority language
+        assert detect_language("The word 'ನಿಲ್ಲಿಸು' means stop in Kannada.") == VOICE_MAP["english_in"]
+        print("  14b. detect_language accurately identifies dominant script; foreign/Chinese text selects English voice.")
+
+        # 14c. SentenceSplitter fragment merging & boundary handling
+        s = SentenceSplitter()
+        f1 = s.feed("1. ")
+        assert f1 == [], f"Expected empty list for short fragment, got {f1}"
+        f2 = s.feed("Step one is ready. 2. ")
+        assert f2 == ["1. Step one is ready."], f"Expected merged sentence, got {f2}"
+        f3 = s.feed("Step two is complete. ")
+        assert f3 == ["2. Step two is complete."], f"Expected merged sentence, got {f3}"
+        # Flush outputs short final sentence
+        s_short = SentenceSplitter()
+        assert s_short.feed("Yes.") == []
+        assert s_short.flush() == ["Yes."]
+
+        # Hindi danda splitting
+        s_hi = SentenceSplitter()
+        hi_out = s_hi.feed("यह पहला वाक्य है। यह दूसरा वाक्य है। ")
+        assert hi_out == ["यह पहला वाक्य है।", "यह दूसरा वाक्य है।"]
+        print("  14c. SentenceSplitter merges short fragments (<2 words) and correctly splits on punctuation & dandas.")
+
+        # 14d. STOP_WORDS single-script verification
+        import app as kalki_app
+        for word in kalki_app.STOP_WORDS:
+            scripts = set()
+            for char in word:
+                if char.isspace() or char in ".,!?:;\"'":
+                    continue
+                cp = ord(char)
+                if cp < 128:
+                    scripts.add("Latin/ASCII")
+                elif 0x0900 <= cp <= 0x097F:
+                    scripts.add("Devanagari")
+                elif 0x0C80 <= cp <= 0x0CFF:
+                    scripts.add("Kannada")
+                else:
+                    scripts.add(f"Other_{cp:04X}")
+            assert len(scripts) <= 1, f"Stop word {word!r} has mixed scripts: {scripts}"
+
+        # Verify pure Kannada 'ನಿಲ್ಲಿಸು'
+        assert "ನಿಲ್ಲಿಸು" in kalki_app.STOP_WORDS
+        assert ord("ನಿಲ್ಲಿಸು"[0]) == 0x0CA8, f"Expected Kannada letter U+0CA8, got {ord('ನಿಲ್ಲಿಸು'[0]):04X}"
+        print("  14d. Every word in STOP_WORDS is verified single-script; 'ನಿಲ್ಲಿಸು' is confirmed pure Kannada.")
+
+        # 14e. Language Guard: retry on wrong script, fallback to English
+        from llm_engine import is_valid_script_reply
+        assert is_valid_script_reply("ಬೆಂಗಳೂರು ಕರ್ನಾಟಕದ ರಾಜಧಾನಿ.", "kannada") == True
+        assert is_valid_script_reply("Paris is the capital.", "kannada") == False
+        assert is_valid_script_reply("这是中文", "kannada") == False
+
+        # Mock LLM returning Chinese for Kannada prompt
+        call_count = 0
+        def mock_llm_chain(prompt, chat_hist=None, custom_instruction=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return "这是错误的中文"  # First call: wrong script
+            elif call_count == 2:
+                return "这是依然错误的中文"  # Retry call: still wrong
+            else:
+                return "Bengaluru is the capital of Karnataka."  # English fallback call
+
+        with patch.object(llm_engine, "_call_groq", side_effect=mock_llm_chain), \
+             patch.dict(os.environ, {"GROQ_API_KEY": "dummy_key"}):
+            guard_res = llm_engine.process_jarvis_intent("ಬೆಂಗಳೂರು ಬಗ್ಗೆ ತಿಳಿಸಿ")
+            assert "Note: Could not respond in Kannada as requested." in guard_res.get("reply", "")
+            assert "Bengaluru is the capital" in guard_res.get("reply", "")
+            # Ensure wrong script (Chinese) was discarded
+            assert "中文" not in guard_res.get("reply", "")
+        print("  14e. Reply Language Guard triggers retry on wrong script, falls back to English with note, and never yields wrong script.")
+        print("  PASS")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"  FAIL — {e}")
+        all_passed = False
+
+    # --------------------------------------------------------------------------
+    # Check 15: TTS Prefetch Architecture, Cancellation Purge, and Single Sentence Cleanup
+    # --------------------------------------------------------------------------
+    print("\n[Check 15] TTS Prefetch Architecture, Cancellation, and Single Sentence Cleanup:")
+    try:
+        import tts_engine
+        import asyncio
+
+        # Read sample dummy bytes for fast unit test execution without network calls
+        sample_mp3_path = Path(os.environ.get("APPDATA", "")) / "KALKI" / "debug_audio" / "live" / "live_001.mp3"
+        if sample_mp3_path.exists():
+            sample_mp3_bytes = sample_mp3_path.read_bytes()
+        else:
+            sample_mp3_bytes = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\x00" * 2000
+
+        # 15a. Prefetch starts sentence N+1 before sentence N finishes playing
+        async def _test_prefetch_starts_ahead():
+            tts_engine.reset_cancel()
+            tts_engine.playback_hook = None
+            synth_events = []
+            play_events = []
+            synth_count = 0
+            play_count = 0
+
+            async def mock_communicate_save(self, path):
+                nonlocal synth_count
+                synth_count += 1
+                idx = synth_count
+                t_start = time.perf_counter()
+                synth_events.append((f"start_synth_{idx}", t_start))
+                Path(path).write_bytes(sample_mp3_bytes)
+                await asyncio.sleep(0.04)
+                t_end = time.perf_counter()
+                synth_events.append((f"end_synth_{idx}", t_end))
+
+            async def mock_play_file(path_str):
+                nonlocal play_count
+                play_count += 1
+                idx = play_count
+                t_start = time.perf_counter()
+                play_events.append((f"start_play_{idx}", t_start))
+                await asyncio.sleep(0.18)
+                t_end = time.perf_counter()
+                play_events.append((f"end_play_{idx}", t_end))
+
+            with patch("edge_tts.Communicate.save", mock_communicate_save), \
+                 patch.object(tts_engine, "_play_file_persistent", mock_play_file):
+                q = tts_engine.get_tts_queue()
+                await tts_engine.enqueue_speech("Sentence number one.")
+                await tts_engine.enqueue_speech("Sentence number two.")
+                await q.join()
+
+            start_play_1 = dict(play_events)["start_play_1"]
+            end_play_1 = dict(play_events)["end_play_1"]
+            start_synth_2 = dict(synth_events)["start_synth_2"]
+
+            assert start_synth_2 < end_play_1, (
+                f"Prefetch failed: Sentence 2 synthesis started at {start_synth_2:.3f}, "
+                f"after Sentence 1 playback ended at {end_play_1:.3f}"
+            )
+
+        asyncio.run(_test_prefetch_starts_ahead())
+        print("  15a. Prefetch starts sentence N+1 while sentence N is still playing.")
+
+        # 15b. Stop cancels prefetched jobs and deletes their files
+        async def _test_stop_cancels_and_deletes_files():
+            tts_engine.reset_cancel()
+            tts_engine.playback_hook = None
+            created_files = []
+
+            async def mock_communicate_save(self, path):
+                created_files.append(Path(path))
+                Path(path).write_bytes(sample_mp3_bytes)
+                await asyncio.sleep(0.02)
+
+            play_started = asyncio.Event()
+            play_stopped = asyncio.Event()
+
+            async def mock_play_file(path_str):
+                play_started.set()
+                try:
+                    while not tts_engine.is_cancelled():
+                        await asyncio.sleep(0.01)
+                finally:
+                    play_stopped.set()
+
+            with patch("edge_tts.Communicate.save", mock_communicate_save), \
+                 patch.object(tts_engine, "_play_file_persistent", mock_play_file):
+                q = tts_engine.get_tts_queue()
+                await tts_engine.enqueue_speech("Sentence one is starting.")
+                await tts_engine.enqueue_speech("Sentence two is prefetched.")
+                await tts_engine.enqueue_speech("Sentence three is queued.")
+
+                await play_started.wait()
+                await asyncio.sleep(0.08)
+
+                assert len(created_files) >= 2, f"Expected at least 2 files created, got {len(created_files)}"
+                prefetched_file = created_files[1]
+                assert prefetched_file.exists(), "Prefetched file does not exist before cancel"
+
+                tts_engine.cancel_playback_and_queue()
+                assert tts_engine.is_cancelled()
+                await play_stopped.wait()
+
+                assert not prefetched_file.exists(), f"Prefetched file {prefetched_file} was not unlinked on cancel!"
+
+        asyncio.run(_test_stop_cancels_and_deletes_files())
+        print("  15b. Stop cancels prefetched jobs and unlinks all prefetched audio files.")
+
+        # 15c. Single-sentence reply still plays and deletes its file cleanly
+        async def _test_single_sentence_plays_and_cleans():
+            tts_engine.reset_cancel()
+            tts_engine.playback_hook = None
+            created_files = []
+            played_files = []
+
+            async def mock_communicate_save(self, path):
+                created_files.append(Path(path))
+                Path(path).write_bytes(sample_mp3_bytes)
+                await asyncio.sleep(0.01)
+
+            async def mock_play_file(path_str):
+                played_files.append(path_str)
+                await asyncio.sleep(0.05)
+
+            with patch("edge_tts.Communicate.save", mock_communicate_save), \
+                 patch.object(tts_engine, "_play_file_persistent", mock_play_file):
+                q = tts_engine.get_tts_queue()
+                await tts_engine.enqueue_speech("Single standalone sentence.")
+                await q.join()
+
+            assert len(played_files) == 1, f"Expected 1 played file, got {len(played_files)}"
+            assert len(created_files) == 1, f"Expected 1 created file, got {len(created_files)}"
+            assert not created_files[0].exists(), f"File {created_files[0]} was not unlinked after playback!"
+
+        asyncio.run(_test_single_sentence_plays_and_cleans())
+        print("  15c. Single-sentence reply plays completely and deletes file cleanly.")
+        print("  PASS")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"  FAIL — {e}")
+        all_passed = False
+
+    # --------------------------------------------------------------------------
     # Summary
     # --------------------------------------------------------------------------
     print("\n" + "=" * 70)
     if all_passed:
-        print("ALL 13 DIAGNOSTICS & SAFETY CHECKS PASSED [PASS]")
+        print("ALL 15 DIAGNOSTICS & SAFETY CHECKS PASSED [PASS]")
         print("=" * 70)
         sys.exit(0)
     else:

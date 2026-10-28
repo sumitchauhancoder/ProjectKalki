@@ -7,10 +7,12 @@ class SentenceSplitter:
     - Emits sentences ending in English (. ! ?), Hindi danda (। U+0964, ॥ U+0965), and Kannada punctuation.
     - Handles sentences split across multiple chunks.
     - Avoids splitting on decimal numbers (e.g., 3.5, 0.01) and common abbreviations (e.g., e.g., i.e., Dr.).
-    - Flushes remaining buffered text when the stream ends.
+    - Merges short fragments (< 2 words, such as list numbers '1.') with the next boundary to maintain natural speech pacing.
+    - Flushes remaining buffered text when the stream ends (even if short).
     """
-    def __init__(self):
+    def __init__(self, min_words: int = 2):
         self.buffer = ""
+        self.min_words = min_words
         self._abbreviations = {
             "e.g.", "i.e.", "dr.", "mr.", "mrs.", "ms.", "prof.", "vs.", "etc.", "st.", "jr.", "sr."
         }
@@ -32,21 +34,32 @@ class SentenceSplitter:
 
     def _extract_sentences(self) -> List[str]:
         sentences = []
+        search_start = 0
+
         while True:
-            boundary = self._find_next_boundary()
+            boundary = self._find_next_boundary(search_start)
             if not boundary:
                 break
             end_pos, next_start = boundary
-            sentence = self.buffer[:end_pos].strip()
+            candidate = self.buffer[:end_pos].strip()
+            word_count = len(candidate.split())
+
+            if word_count < self.min_words:
+                # Candidate is too short (e.g. '1.' or short prefix); look for next boundary
+                search_start = next_start
+                continue
+
+            # Complete sentence with enough words
             self.buffer = self.buffer[next_start:]
-            if sentence:
-                sentences.append(sentence)
+            sentences.append(candidate)
+            search_start = 0
+
         return sentences
 
-    def _find_next_boundary(self) -> Optional[Tuple[int, int]]:
+    def _find_next_boundary(self, start_pos: int = 0) -> Optional[Tuple[int, int]]:
         buf = self.buffer
         length = len(buf)
-        i = 0
+        i = start_pos
 
         while i < length:
             char = buf[i]
