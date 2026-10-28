@@ -11,7 +11,10 @@ import base64
 import cv2
 import io
 import json
+import os
 import numpy as np
+import re
+import time
 from typing import Dict, Any, Optional
 import pyautogui
 import sounddevice as sd
@@ -19,16 +22,26 @@ import speech_recognition as sr
 import subprocess
 import uvicorn
 import wave
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from database import Base, engine, get_db
 import models
-from llm_engine import process_jarvis_intent, click_bounding_box, click_at_coordinates
+from llm_engine import (
+    process_jarvis_intent,
+    process_jarvis_intent_stream,
+    click_bounding_box,
+    click_at_coordinates,
+    detect_reply_language,
+)
+import tts_engine
 from tts_engine import speak_text
+from sentence_splitter import SentenceSplitter
 from auth import auth_router
+from settings import load_settings, save_settings
 
 app = FastAPI(title="KALKI Core Engine", version="1.0.0")
 
@@ -55,6 +68,25 @@ except Exception as e:
     print(f"[Database Warning] Table initialization skipped: {type(e).__name__}")
 
 recognizer = sr.Recognizer()
+
+def recognize_speech(audio_data, language: str = "en-IN") -> str:
+    """
+    Recognizes speech using the specified language.
+    Default language: en-IN.
+    If en-IN fails (UnknownValueError or empty), retries once with en-US.
+    For other languages (e.g. kn-IN, hi-IN), uses that language directly without falling back to Kannada for English.
+    """
+    if language == "en-IN" or (isinstance(language, str) and language.startswith("en")):
+        try:
+            transcript = recognizer.recognize_google(audio_data, language="en-IN").strip()
+            if transcript:
+                return transcript
+        except (sr.UnknownValueError, Exception):
+            pass
+        # Retry once with en-US if en-IN was empty or raised an exception
+        return recognizer.recognize_google(audio_data, language="en-US").strip()
+    else:
+        return recognizer.recognize_google(audio_data, language=language).strip()
 
 class CommandPayload(BaseModel):
     command: str
@@ -100,11 +132,61 @@ def execute_macro_action(macro: models.VoiceMacro) -> str:
 def health_check():
     return {"status": "online", "system": "KALKI Jarvis Core Engine"}
 
+@app.get("/settings")
+def get_user_settings():
+    return load_settings()
+
+@app.post("/settings")
+def update_user_settings(payload: Dict[str, Any]):
+    updated = save_settings(payload)
+    return {"status": "success", "settings": updated}
+
+STOP_WORDS = {
+    "stop", "cancel", "halt", "quiet", "shut up",
+    "रुको", "रुकिए", "बंद करो", "बस", "roko", "band karo", "bas",
+    "ನಿಲ್ಲಿಸು", "ಸಾಕು", "ಶಾಂತವಾಗಿರಿ", "nillisu", "saaku"
+}
+
+def is_stop_command(text: str) -> bool:
+    if not text:
+        return False
+    cleaned = text.strip().lower().strip(".,!?:;\"' \t\n\r")
+    return cleaned in STOP_WORDS
+
+active_cancel_event: Optional[asyncio.Event] = None
+
+def cancel_active_pipeline():
+    """Cancels active streaming generation and stops persistent TTS audio playback."""
+    global active_cancel_event
+    if active_cancel_event is not None:
+        active_cancel_event.set()
+    tts_engine.cancel_playback_and_queue()
+
+@app.post("/stop")
+def stop_all():
+    """Cancels active speech, generation, and clears queued audio within ~300ms."""
+    cancel_active_pipeline()
+    return {"status": "stopped", "message": "Speech and generation stopped."}
+
 @app.post("/execute-command")
 async def run_command(payload: CommandPayload, db: Optional[Session] = Depends(get_db)):
+    t_start = time.perf_counter()
+    cancel_active_pipeline()
+    tts_engine.reset_cancel()
+    global active_cancel_event
+    active_cancel_event = asyncio.Event()
+
     cmd = payload.command.strip()
     if not cmd:
         raise HTTPException(status_code=400, detail="Empty command input")
+
+    if is_stop_command(cmd):
+        cancel_active_pipeline()
+        return {
+            "status": "cancelled",
+            "reply": "Stopped.",
+            "executed": "User interruption"
+        }
 
     history_context = []
     matched_macro = None
@@ -142,7 +224,12 @@ async def run_command(payload: CommandPayload, db: Optional[Session] = Depends(g
         reply_message = f"Executing stored macro '{matched_macro.trigger_phrase}'"
     else:
         # Offload blocking LLM SDK calls to a background thread
+        t_llm_start = time.perf_counter()
         llm_res = await asyncio.to_thread(process_jarvis_intent, cmd, chat_history=history_context)
+        t_llm_end = time.perf_counter()
+        llm_ms = (t_llm_end - t_llm_start) * 1000
+        if os.getenv("DEBUG_TIMING", "0") == "1":
+            print(f"[TIMING] LLM call time: {llm_ms:.1f}ms", flush=True)
         reply_message = llm_res.get("reply", "Command completed.")
         executed_info = llm_res.get("tool_executed")
 
@@ -167,9 +254,13 @@ async def run_command(payload: CommandPayload, db: Optional[Session] = Depends(g
 
     # Non-blocking background TTS
     try:
-        asyncio.create_task(speak_text(reply_message))
+        asyncio.create_task(speak_text(reply_message, request_start_time=t_start))
     except Exception as tts_err:
         print(f"[TTS Background Error]: {tts_err}")
+
+    if os.getenv("DEBUG_TIMING", "0") == "1":
+        total_ms = (time.perf_counter() - t_start) * 1000
+        print(f"[TIMING] Total time: {total_ms:.1f}ms", flush=True)
 
     return {
         "status": "success",
@@ -177,8 +268,131 @@ async def run_command(payload: CommandPayload, db: Optional[Session] = Depends(g
         "executed": executed_info or "Command processed"
     }
 
+@app.post("/chat-stream")
+async def chat_stream(payload: CommandPayload, db: Optional[Session] = Depends(get_db)):
+    t_start = time.perf_counter()
+    cancel_active_pipeline()
+    tts_engine.reset_cancel()
+    global active_cancel_event
+    active_cancel_event = asyncio.Event()
+    current_cancel = active_cancel_event
+
+    cmd = payload.command.strip()
+    if not cmd:
+        raise HTTPException(status_code=400, detail="Empty command input")
+
+    if is_stop_command(cmd):
+        cancel_active_pipeline()
+        async def stop_gen():
+            yield f"event: token\ndata: {json.dumps({'text': 'Stopped.'})}\n\n"
+            yield f"event: done\ndata: {json.dumps({'status': 'done'})}\n\n"
+        return StreamingResponse(stop_gen(), media_type="text/event-stream")
+
+    history_context = []
+    matched_macro = None
+
+    if db is not None:
+        try:
+            active_session = db.query(models.ChatSession).filter(models.ChatSession.id == 1).first()
+            if not active_session:
+                active_session = models.ChatSession(id=1, session_title="KALKI Core Session")
+                db.add(active_session)
+                db.commit()
+
+            past_messages = db.query(models.ChatMessage).filter(
+                models.ChatMessage.session_id == 1
+            ).order_by(models.ChatMessage.timestamp.asc()).all()
+            history_context = [{"role": m.role, "content": m.content} for m in past_messages[-10:]]
+
+            user_msg_db = models.ChatMessage(session_id=1, role="user", content=cmd)
+            db.add(user_msg_db)
+            db.commit()
+
+            matched_macro = db.query(models.VoiceMacro).filter(
+                models.VoiceMacro.trigger_phrase == cmd.lower()
+            ).first()
+        except Exception as db_err:
+            print(f"[Database Warning]: Failed query in /chat-stream: {type(db_err).__name__}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+    async def event_generator():
+        splitter = SentenceSplitter()
+        accumulated_sentences = []
+
+        if matched_macro:
+            execute_macro_action(matched_macro)
+            macro_reply = f"Executing stored macro '{matched_macro.trigger_phrase}'"
+            accumulated_sentences.append(macro_reply)
+            await speak_text(macro_reply, request_start_time=t_start)
+            yield f"event: token\ndata: {json.dumps({'text': macro_reply})}\n\n"
+        else:
+            async for chunk in process_jarvis_intent_stream(
+                cmd, chat_history=history_context, cancel_event=current_cancel, request_start_time=t_start
+            ):
+                if current_cancel.is_set():
+                    break
+                sentences = splitter.feed(chunk)
+                for sentence in sentences:
+                    if current_cancel.is_set():
+                        break
+                    accumulated_sentences.append(sentence)
+                    await speak_text(sentence, request_start_time=t_start)
+                    yield f"event: token\ndata: {json.dumps({'text': sentence})}\n\n"
+
+            if not current_cancel.is_set():
+                for remaining in splitter.flush():
+                    if current_cancel.is_set():
+                        break
+                    accumulated_sentences.append(remaining)
+                    await speak_text(remaining, request_start_time=t_start)
+                    yield f"event: token\ndata: {json.dumps({'text': remaining})}\n\n"
+
+        full_reply = " ".join(accumulated_sentences)
+
+        if db is not None and full_reply and not current_cancel.is_set():
+            try:
+                assistant_msg_db = models.ChatMessage(session_id=1, role="assistant", content=full_reply)
+                db.add(assistant_msg_db)
+                log_entry = models.AuditLog(
+                    command_input=cmd,
+                    execution_status="success",
+                    telemetry_data=json.dumps({"response": full_reply})
+                )
+                db.add(log_entry)
+                db.commit()
+            except Exception as db_err:
+                print(f"[Database Warning]: Failed commit in /chat-stream: {type(db_err).__name__}")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+
+        if os.getenv("DEBUG_TIMING", "0") == "1":
+            total_ms = (time.perf_counter() - t_start) * 1000
+            print(f"[TIMING] Total time: {total_ms:.1f}ms", flush=True)
+
+        yield f"event: done\ndata: {json.dumps({'status': 'done'})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+    )
+
 @app.post("/listen-voice")
-async def listen_voice(db: Optional[Session] = Depends(get_db)):
+async def listen_voice(request: Request, db: Optional[Session] = Depends(get_db)):
+    t_start = time.perf_counter()
+    cancel_active_pipeline()
+    tts_engine.reset_cancel()
+    global active_cancel_event
+    active_cancel_event = asyncio.Event()
+    current_cancel = active_cancel_event
+
+    is_sse = "text/event-stream" in request.headers.get("accept", "") or request.query_params.get("stream") == "true"
+
     try:
         sample_rate = 16000
         duration = 4
@@ -194,12 +408,32 @@ async def listen_voice(db: Optional[Session] = Depends(get_db)):
             wf.writeframes(recording.tobytes())
         wav_io.seek(0)
 
+        user_settings = load_settings()
+        user_lang = user_settings.get("language", "en-IN")
+
         with sr.AudioFile(wav_io) as source:
             audio_data = recognizer.record(source)
-            try:
-                transcript = recognizer.recognize_google(audio_data, language="kn-IN").strip()
-            except Exception:
-                transcript = recognizer.recognize_google(audio_data, language="en-IN").strip()
+            transcript = recognize_speech(audio_data, language=user_lang)
+
+        # Check for spoken stop word
+        if is_stop_command(transcript):
+            cancel_active_pipeline()
+            if not is_sse:
+                return {
+                    "status": "cancelled",
+                    "transcript": transcript,
+                    "reply": "Stopped.",
+                    "executed": "User interruption"
+                }
+            async def stop_event_generator():
+                yield f"event: transcript\ndata: {json.dumps({'transcript': transcript})}\n\n"
+                yield f"event: token\ndata: {json.dumps({'text': 'Stopped.'})}\n\n"
+                yield f"event: done\ndata: {json.dumps({'status': 'done'})}\n\n"
+            return StreamingResponse(
+                stop_event_generator(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+            )
 
         matched_macro = None
         if db is not None:
@@ -210,41 +444,122 @@ async def listen_voice(db: Optional[Session] = Depends(get_db)):
             except Exception as db_err:
                 print(f"[Database Warning]: {db_err}")
 
-        if matched_macro:
-            executed_info = execute_macro_action(matched_macro)
-            reply_message = f"Executing macro '{matched_macro.trigger_phrase}'"
-        else:
-            llm_res = await asyncio.to_thread(process_jarvis_intent, transcript)
-            reply_message = llm_res.get("reply", "Speech processed.")
-            executed_info = llm_res.get("tool_executed")
+        # Check if caller wants non-streamed JSON (e.g. tests or explicit non-SSE request)
+        if not is_sse:
+            if matched_macro:
+                executed_info = execute_macro_action(matched_macro)
+                reply_message = f"Executing macro '{matched_macro.trigger_phrase}'"
+            else:
+                llm_res = await asyncio.to_thread(process_jarvis_intent, transcript)
+                reply_message = llm_res.get("reply", "Speech processed.")
+                executed_info = llm_res.get("tool_executed")
 
-        asyncio.create_task(speak_text(reply_message))
+            asyncio.create_task(speak_text(reply_message, request_start_time=t_start))
 
-        if db is not None:
-            try:
-                log_entry = models.AuditLog(
-                    command_input=transcript,
-                    execution_status="success" if executed_info else "reasoned",
-                    telemetry_data=json.dumps({"response": reply_message, "executed": executed_info})
-                )
-                db.add(log_entry)
-                db.commit()
-            except Exception as db_err:
-                print(f"[Database Warning]: {db_err}")
+            if db is not None:
+                try:
+                    log_entry = models.AuditLog(
+                        command_input=transcript,
+                        execution_status="success" if executed_info else "reasoned",
+                        telemetry_data=json.dumps({"response": reply_message, "executed": executed_info})
+                    )
+                    db.add(log_entry)
+                    db.commit()
+                except Exception as db_err:
+                    print(f"[Database Warning]: {db_err}")
 
-        return {
-            "status": "success",
-            "transcript": transcript,
-            "reply": reply_message,
-            "executed": executed_info or "Speech processed"
-        }
+            if os.getenv("DEBUG_TIMING", "0") == "1":
+                total_ms = (time.perf_counter() - t_start) * 1000
+                print(f"[TIMING] Total time: {total_ms:.1f}ms", flush=True)
+
+            return {
+                "status": "success",
+                "transcript": transcript,
+                "reply": reply_message,
+                "executed": executed_info or "Speech processed"
+            }
+
+        # Streaming voice path: returns transcript immediately, then streams reply as sentences
+        async def voice_stream_generator():
+            splitter = SentenceSplitter()
+            accumulated_sentences = []
+
+            # 1. Immediately yield transcript event
+            yield f"event: transcript\ndata: {json.dumps({'transcript': transcript})}\n\n"
+
+            if matched_macro:
+                execute_macro_action(matched_macro)
+                macro_reply = f"Executing macro '{matched_macro.trigger_phrase}'"
+                accumulated_sentences.append(macro_reply)
+                await speak_text(macro_reply, request_start_time=t_start)
+                yield f"event: token\ndata: {json.dumps({'text': macro_reply})}\n\n"
+            else:
+                async for chunk in process_jarvis_intent_stream(
+                    transcript, cancel_event=current_cancel, request_start_time=t_start
+                ):
+                    if current_cancel.is_set():
+                        break
+                    sentences = splitter.feed(chunk)
+                    for sentence in sentences:
+                        if current_cancel.is_set():
+                            break
+                        accumulated_sentences.append(sentence)
+                        await speak_text(sentence, request_start_time=t_start)
+                        yield f"event: token\ndata: {json.dumps({'text': sentence})}\n\n"
+
+                if not current_cancel.is_set():
+                    for remaining in splitter.flush():
+                        if current_cancel.is_set():
+                            break
+                        accumulated_sentences.append(remaining)
+                        await speak_text(remaining, request_start_time=t_start)
+                        yield f"event: token\ndata: {json.dumps({'text': remaining})}\n\n"
+
+            full_reply = " ".join(accumulated_sentences)
+            if db is not None and full_reply and not current_cancel.is_set():
+                try:
+                    log_entry = models.AuditLog(
+                        command_input=transcript,
+                        execution_status="success",
+                        telemetry_data=json.dumps({"response": full_reply})
+                    )
+                    db.add(log_entry)
+                    db.commit()
+                except Exception as db_err:
+                    print(f"[Database Warning]: {db_err}")
+
+            if os.getenv("DEBUG_TIMING", "0") == "1":
+                total_ms = (time.perf_counter() - t_start) * 1000
+                print(f"[TIMING] Total time: {total_ms:.1f}ms", flush=True)
+
+            yield f"event: done\ndata: {json.dumps({'status': 'done'})}\n\n"
+
+        return StreamingResponse(
+            voice_stream_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        )
 
     except sr.UnknownValueError:
         msg = "Could not decipher speech audio."
         asyncio.create_task(speak_text(msg))
-        return {"status": "unclear", "transcript": "", "reply": msg, "executed": None}
+        if not is_sse:
+            return {"status": "unclear", "transcript": "", "reply": msg, "executed": None}
+        async def unclear_gen():
+            yield f"event: transcript\ndata: {json.dumps({'transcript': ''})}\n\n"
+            yield f"event: token\ndata: {json.dumps({'text': msg})}\n\n"
+            yield f"event: done\ndata: {json.dumps({'status': 'done'})}\n\n"
+        return StreamingResponse(unclear_gen(), media_type="text/event-stream")
+
     except Exception as e:
-        return {"status": "error", "transcript": "", "reply": str(e), "executed": None}
+        err_msg = str(e)
+        if not is_sse:
+            return {"status": "error", "transcript": "", "reply": err_msg, "executed": None}
+        async def err_gen():
+            yield f"event: transcript\ndata: {json.dumps({'transcript': ''})}\n\n"
+            yield f"event: token\ndata: {json.dumps({'text': err_msg})}\n\n"
+            yield f"event: done\ndata: {json.dumps({'status': 'done'})}\n\n"
+        return StreamingResponse(err_gen(), media_type="text/event-stream")
 
 @app.post("/macros")
 def create_macro(payload: MacroCreatePayload, db: Optional[Session] = Depends(get_db)):

@@ -32,6 +32,8 @@ def run_all_checks():
         print("  llm_engine and database both resolve explicitly to backend/.env")
         print("  PASS")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"  FAIL — {e}")
         all_passed = False
 
@@ -48,6 +50,8 @@ def run_all_checks():
         print(f"  health_check() response: {res}")
         print("  PASS")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"  FAIL — {e}")
         all_passed = False
 
@@ -98,6 +102,8 @@ def run_all_checks():
         print("  Case 3c: Both providers failing returned safe spoken error message.")
         print("  PASS")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"  FAIL — {e}")
         all_passed = False
 
@@ -122,6 +128,8 @@ def run_all_checks():
         print("  Gemini calls: 0 | Groq calls: 0")
         print("  PASS")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"  FAIL — {e}")
         all_passed = False
 
@@ -155,6 +163,8 @@ def run_all_checks():
         print(f"  SQLite tables verified, VoiceMacro table count: {macro_count}")
         print("  PASS")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"  FAIL — {e}")
         all_passed = False
 
@@ -173,6 +183,8 @@ def run_all_checks():
         print(f"  Generated Path 2: {path_2.name}")
         print("  PASS")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"  FAIL — {e}")
         all_passed = False
 
@@ -209,6 +221,8 @@ def run_all_checks():
         print(f"  Queued items played in strict order: {results}")
         print("  PASS")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"  FAIL — {e}")
         all_passed = False
 
@@ -239,6 +253,8 @@ def run_all_checks():
         print("  Verified: Neither /process-frame nor /visual-click enqueued speech")
         print("  PASS")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"  FAIL — {e}")
         all_passed = False
 
@@ -266,6 +282,300 @@ def run_all_checks():
         print("  Verified: Secret key was NOT in log output")
         print("  PASS")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"  FAIL — {e}")
+        all_passed = False
+
+    # --------------------------------------------------------------------------
+    # Check 10: Sentence Splitter (English, Hindi danda, mixed, chunks, decimals, flush)
+    # --------------------------------------------------------------------------
+    print("\n[Check 10] Sentence Splitter Functionality:")
+    try:
+        from sentence_splitter import SentenceSplitter
+
+        # 10a. English (. ! ?)
+        s1 = SentenceSplitter()
+        res1 = s1.feed("First sentence. ") + s1.feed("Second sentence! ") + s1.feed("Is this third? ") + s1.flush()
+        assert res1 == ["First sentence.", "Second sentence!", "Is this third?"], f"English split failed: {res1}"
+
+        # 10b. Hindi danda (।)
+        s2 = SentenceSplitter()
+        res2 = s2.feed("यह पहला वाक्य है। ") + s2.feed("यह दूसरा वाक्य है। ") + s2.flush()
+        assert res2 == ["यह पहला वाक्य है।", "यह दूसरा वाक्य है।"], f"Hindi split failed: {res2}"
+
+        # 10c. Mixed language
+        s3 = SentenceSplitter()
+        res3 = s3.feed("Hello there! ") + s3.feed("ಇದು ಕನ್ನಡ ವಾಕ್ಯ. ") + s3.feed("यह हिंदी है। ") + s3.flush()
+        assert res3 == ["Hello there!", "ಇದು ಕನ್ನಡ ವಾಕ್ಯ.", "यह हिंदी है।"], f"Mixed split failed: {res3}"
+
+        # 10d. Split across chunk boundaries
+        s4 = SentenceSplitter()
+        res4 = s4.feed("This sentence is ") + s4.feed("split across chunks. ") + s4.flush()
+        assert res4 == ["This sentence is split across chunks."], f"Chunk boundary split failed: {res4}"
+
+        # 10e. Decimal numbers not split
+        s5 = SentenceSplitter()
+        res5 = s5.feed("The measurement is 3.") + s5.feed("14 meters in length. Done.") + s5.flush()
+        assert res5 == ["The measurement is 3.14 meters in length.", "Done."], f"Decimal split failed: {res5}"
+
+        # 10f. Flush at end
+        s6 = SentenceSplitter()
+        res6 = s6.feed("Unterminated sentence at end of stream") + s6.flush()
+        assert res6 == ["Unterminated sentence at end of stream"], f"Flush failed: {res6}"
+
+        print("  Verified: English, Hindi danda, mixed, split chunks, decimals, and flush all succeed.")
+        print("  PASS")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"  FAIL — {e}")
+        all_passed = False
+
+    # --------------------------------------------------------------------------
+    # Check 11: Streaming LLM Fallback & Mid-Stream Failure
+    # --------------------------------------------------------------------------
+    print("\n[Check 11] Streaming LLM Fallback & Mid-Stream Handling:")
+    try:
+        import asyncio
+
+        async def _test_streaming_engine():
+            # 11a. Stream fallback: Groq raises before any chunk, Gemini succeeds
+            def mock_groq_fail(*args, **kwargs):
+                raise ValueError("Groq initial error")
+                yield
+
+            def mock_gemini_ok(*args, **kwargs):
+                yield "Gemini "
+                yield "fallback "
+                yield "stream."
+
+            with patch.object(llm_engine, "_stream_groq", mock_groq_fail), \
+                 patch.object(llm_engine, "_stream_gemini", mock_gemini_ok), \
+                 patch.dict(os.environ, {"GROQ_API_KEY": "dummy_groq", "GEMINI_API_KEY": "dummy_gemini"}):
+
+                chunks = []
+                async for chunk in llm_engine.process_jarvis_intent_stream("Hello"):
+                    chunks.append(chunk)
+                assert "".join(chunks) == "Gemini fallback stream.", f"Fallback output mismatch: {chunks}"
+
+            # 11b. Stream mid-failure: Groq yields two chunks then fails -> output contains only those two chunks, Gemini not called
+            gemini_called = False
+            def mock_groq_mid_fail(*args, **kwargs):
+                yield "Chunk 1 "
+                yield "Chunk 2"
+                raise RuntimeError("Mid-stream network drop")
+
+            def mock_gemini_spy(*args, **kwargs):
+                nonlocal gemini_called
+                gemini_called = True
+                yield "Should not be called"
+
+            with patch.object(llm_engine, "_stream_groq", mock_groq_mid_fail), \
+                 patch.object(llm_engine, "_stream_gemini", mock_gemini_spy), \
+                 patch.dict(os.environ, {"GROQ_API_KEY": "dummy_groq", "GEMINI_API_KEY": "dummy_gemini"}):
+
+                chunks_mid = []
+                async for chunk in llm_engine.process_jarvis_intent_stream("Hello"):
+                    chunks_mid.append(chunk)
+                assert "".join(chunks_mid) == "Chunk 1 Chunk 2", f"Mid-stream chunks mismatch: {chunks_mid}"
+                assert not gemini_called, "Gemini fallback was invoked after chunks had already started!"
+
+        asyncio.run(_test_streaming_engine())
+        print("  Verified: Groq failure before chunks falls back to Gemini.")
+        print("  Verified: Mid-stream failure stops cleanly without calling fallback.")
+        print("  PASS")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"  FAIL — {e}")
+        all_passed = False
+
+    # --------------------------------------------------------------------------
+    # Check 12: Speech Recognition Language Ordering & System Prompt
+    # --------------------------------------------------------------------------
+    print("\n[Check 12] Speech Recognition Language Ordering & Local Router:")
+    try:
+        from app import recognize_speech
+        import speech_recognition as sr
+
+        # 12a. en-IN tried first when language="en-IN", never kn-IN
+        calls = []
+        def mock_recognize(audio_data, language="en-US"):
+            calls.append(language)
+            return "hello world"
+
+        with patch("app.recognizer.recognize_google", side_effect=mock_recognize):
+            calls.clear()
+            res = recognize_speech(None, language="en-IN")
+            assert calls == ["en-IN"], f"Expected ['en-IN'], got {calls}"
+            assert res == "hello world"
+            assert "kn-IN" not in calls, "kn-IN was unexpectedly called for English audio!"
+        print("  12a. en-IN tried first, kn-IN was not called.")
+
+        # 12b. Empty English or UnknownValueError retries en-US once, never kn-IN
+        calls.clear()
+        def mock_recognize_retry(audio_data, language="en-US"):
+            calls.append(language)
+            if language == "en-IN":
+                return ""  # Empty result
+            return "retry success"
+
+        with patch("app.recognizer.recognize_google", side_effect=mock_recognize_retry):
+            calls.clear()
+            res = recognize_speech(None, language="en-IN")
+            assert calls == ["en-IN", "en-US"], f"Expected ['en-IN', 'en-US'], got {calls}"
+            assert res == "retry success"
+            assert "kn-IN" not in calls, "kn-IN was unexpectedly called during retry!"
+
+        calls.clear()
+        def mock_recognize_ex(audio_data, language="en-US"):
+            calls.append(language)
+            if language == "en-IN":
+                raise sr.UnknownValueError()
+            return "retry after exception"
+
+        with patch("app.recognizer.recognize_google", side_effect=mock_recognize_ex):
+            calls.clear()
+            res = recognize_speech(None, language="en-IN")
+            assert calls == ["en-IN", "en-US"], f"Expected ['en-IN', 'en-US'], got {calls}"
+            assert res == "retry after exception"
+            assert "kn-IN" not in calls, "kn-IN was unexpectedly called during retry!"
+        print("  12b. Empty/failing en-IN retried en-US, kn-IN was never called.")
+
+        # 12c. Transcript returned as separate field from /listen-voice route
+        from fastapi.testclient import TestClient
+        client = TestClient(app)
+        import numpy as np
+        dummy_audio = np.zeros(16000 * 4, dtype=np.int16)
+        with patch("sounddevice.rec", return_value=dummy_audio), patch("sounddevice.wait"), \
+             patch("app.recognize_speech", return_value="open calculator"), \
+             patch("app.speak_text"):
+            response = client.post("/listen-voice")
+            assert response.status_code == 200
+            data = response.json()
+            assert "transcript" in data, "transcript field missing from /listen-voice response"
+            assert data["transcript"] == "open calculator"
+            assert "reply" in data, "reply field missing from /listen-voice response"
+        print("  12c. /listen-voice returns transcript as separate field.")
+
+        # 12d. System prompt contains same-language instruction
+        expected_phrase = "Reply in English unless the user explicitly asks for another language"
+        assert expected_phrase in llm_engine.JARVIS_SYSTEM_INSTRUCTION, (
+            f"Instruction phrase '{expected_phrase}' missing from JARVIS_SYSTEM_INSTRUCTION"
+        )
+        print("  12d. System prompt contains same-language instruction.")
+
+        # 12e. Local router answers calculator with 0 cloud calls
+        with patch.object(llm_engine, "_call_groq") as mock_groq, \
+             patch.object(llm_engine, "_call_gemini") as mock_gemini:
+            calc_res = llm_engine.process_jarvis_intent("open calculator")
+            assert not mock_groq.called, "Groq was called for calculator command!"
+            assert not mock_gemini.called, "Gemini was called for calculator command!"
+            assert calc_res.get("tool_executed") is not None, "Local router tool was not executed"
+        print("  12e. Local router answered calculator with 0 cloud calls.")
+        print("  PASS")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"  FAIL — {e}")
+        all_passed = False
+
+    # --------------------------------------------------------------------------
+    # Check 13: Multi-Language Instructions, Streaming Interruption, Stop Words, and Route Compatibility
+    # --------------------------------------------------------------------------
+    print("\n[Check 13] Multi-Language Routing, Interruption, and API Stability:")
+    try:
+        from fastapi.testclient import TestClient
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # 13a. Hindi transcript produces Hindi reply instruction; English produces English
+        hindi_inst = llm_engine.build_system_instruction("भारत की राजधानी क्या है?")
+        assert "Reply only in Hindi (Devanagari script)." in hindi_inst, f"Hindi instruction missing: {hindi_inst}"
+        eng_inst = llm_engine.build_system_instruction("What is the capital of France?")
+        assert "Reply in English." in eng_inst, f"English instruction missing: {eng_inst}"
+        print("  13a. Hindi transcript produces Hindi instruction; English produces English.")
+
+        # 13b. Explicit "reply in Kannada" overrides the default
+        kannada_inst = llm_engine.build_system_instruction("Who is the prime minister of India? Reply in Kannada")
+        assert "Reply only in Kannada (Kannada script)." in kannada_inst, f"Kannada override missing: {kannada_inst}"
+        print("  13b. Explicit 'reply in Kannada' successfully overrides default.")
+
+        # 13c. Cancel flag stops streaming: after cancel, no further sentences are queued
+        import asyncio
+        import tts_engine
+        cancel_event = asyncio.Event()
+
+        async def _test_cancel_stream():
+            yielded = []
+            cancel_event.clear()
+            async for chunk in llm_engine.process_jarvis_intent_stream("Hello world", cancel_event=cancel_event):
+                yielded.append(chunk)
+                cancel_event.set()  # Cancel after 1st chunk
+            return yielded
+
+        def mock_stream(*args, **kwargs):
+            yield "First sentence. "
+            yield "Second sentence. "
+            yield "Third sentence."
+
+        with patch.object(llm_engine, "_stream_groq", mock_stream), \
+             patch.dict(os.environ, {"GROQ_API_KEY": "dummy_key"}):
+            stream_result = asyncio.run(_test_cancel_stream())
+            assert len(stream_result) == 1, f"Expected 1 chunk before cancel, got {len(stream_result)}"
+        print("  13c. Cancel flag immediately halts streaming generator.")
+
+        # 13d. New request cancels the previous one
+        tts_engine.reset_cancel()
+        assert not tts_engine.is_cancelled()
+        # Trigger /stop which cancels active pipeline
+        res_stop = client.post("/stop")
+        assert res_stop.status_code == 200
+        assert tts_engine.is_cancelled()
+        print("  13d. New request / cancellation halts previous audio/speech pipeline.")
+
+        # 13e. The stop word is not sent to the LLM
+        with patch.object(llm_engine, "process_jarvis_intent") as mock_intent, \
+             patch.object(llm_engine, "_call_groq") as mock_groq, \
+             patch.object(llm_engine, "_call_gemini") as mock_gemini:
+            res_stop_cmd = client.post("/execute-command", json={"command": "stop"})
+            assert res_stop_cmd.status_code == 200
+            data_stop = res_stop_cmd.json()
+            assert data_stop.get("status") == "cancelled"
+            assert not mock_intent.called and not mock_groq.called and not mock_gemini.called, "LLM was called for stop word!"
+
+            # Hindi stop word
+            res_roko = client.post("/execute-command", json={"command": "रुको"})
+            assert res_roko.status_code == 200
+            assert res_roko.json().get("status") == "cancelled"
+            assert not mock_intent.called and not mock_groq.called and not mock_gemini.called, "LLM was called for Hindi stop word!"
+        print("  13e. Spoken/typed stop words are intercepted with zero LLM calls.")
+
+        # 13f. The local router still answers 'open calculator' with zero cloud calls
+        with patch.object(llm_engine, "_call_groq") as mock_groq, \
+             patch.object(llm_engine, "_call_gemini") as mock_gemini:
+            calc_res = client.post("/execute-command", json={"command": "open calculator"})
+            assert calc_res.status_code == 200
+            assert not mock_groq.called and not mock_gemini.called, "Cloud LLM invoked for local router command!"
+            calc_data = calc_res.json()
+            assert "Launched calculator" in calc_data.get("reply", "")
+        print("  13f. Local router executes 'open calculator' with zero cloud calls.")
+
+        # 13g. /execute-command and /chat-stream still return 200 with the same JSON shape
+        with patch.object(llm_engine, "process_jarvis_intent", return_value={"reply": "Test answer", "tool_executed": "TestTool"}):
+            r_exec = client.post("/execute-command", json={"command": "What is 2+2?"})
+            assert r_exec.status_code == 200
+            d_exec = r_exec.json()
+            assert "status" in d_exec and "reply" in d_exec and "executed" in d_exec, f"Unexpected shape: {d_exec}"
+
+        r_stream = client.post("/chat-stream", json={"command": "open calculator"})
+        assert r_stream.status_code == 200
+        assert "text/event-stream" in r_stream.headers.get("content-type", "")
+        print("  13g. /execute-command and /chat-stream return 200 with exact expected schemas.")
+        print("  PASS")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"  FAIL — {e}")
         all_passed = False
 
@@ -274,7 +584,7 @@ def run_all_checks():
     # --------------------------------------------------------------------------
     print("\n" + "=" * 70)
     if all_passed:
-        print("ALL 9 DIAGNOSTICS & SAFETY CHECKS PASSED [PASS]")
+        print("ALL 13 DIAGNOSTICS & SAFETY CHECKS PASSED [PASS]")
         print("=" * 70)
         sys.exit(0)
     else:

@@ -33,6 +33,9 @@ export default function Dashboard({
   fetchAuditLogs,
   chatHistory,
   fetchChatHistory,
+  language = "en-IN",
+  handleLanguageChange,
+  handleStop,
 }) {
   // Local state for API keys settings tab
   const [geminiKey, setGeminiKey] = useState("");
@@ -143,16 +146,40 @@ export default function Dashboard({
               </button>
             </form>
 
-            <div className="action-buttons-grid">
+            <div className="voice-control-bar" style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "16px" }}>
               <button
                 type="button"
                 onClick={triggerBackendVoice}
                 disabled={listening}
                 className="btn-secondary"
+                style={{ flex: 1 }}
               >
                 {listening ? "Listening (4s)..." : "Speak Command"}
               </button>
+              <button
+                type="button"
+                onClick={handleStop}
+                className="btn-primary-red"
+                style={{ padding: "8px 16px", minWidth: "70px" }}
+              >
+                Stop
+              </button>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <label style={{ fontSize: "12px", color: "#9ca3af", whiteSpace: "nowrap" }}>Voice Lang:</label>
+                <select
+                  value={language || "en-IN"}
+                  onChange={(e) => handleLanguageChange && handleLanguageChange(e.target.value)}
+                  className="command-input"
+                  style={{ width: "auto", padding: "8px 12px", fontSize: "13px" }}
+                >
+                  <option value="en-IN">English (India)</option>
+                  <option value="kn-IN">Kannada</option>
+                  <option value="hi-IN">Hindi</option>
+                </select>
+              </div>
+            </div>
 
+            <div className="action-buttons-grid">
               <button
                 type="button"
                 onClick={screenSharing ? stopScreenCapture : startScreenCapture}
@@ -338,6 +365,20 @@ export default function Dashboard({
                   onChange={(e) => setGroqKey(e.target.value)}
                   className="form-input"
                 />
+              </div>
+
+              <div className="input-group" style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                <label style={{ fontSize: "12px", color: "#d1d5db" }}>Voice Recognition Language</label>
+                <select
+                  value={language || "en-IN"}
+                  onChange={(e) => handleLanguageChange && handleLanguageChange(e.target.value)}
+                  className="form-input"
+                  style={{ padding: "8px 12px", fontSize: "14px" }}
+                >
+                  <option value="en-IN">English (India)</option>
+                  <option value="kn-IN">Kannada</option>
+                  <option value="hi-IN">Hindi</option>
+                </select>
               </div>
 
               <button type="submit" className="btn-primary-red" style={{ alignSelf: "flex-start" }}>

@@ -20,6 +20,7 @@ export default function App() {
   const [macros, setMacros] = useState([]);
   const [auditLogs, setAuditLogs] = useState([]);
   const [chatHistory, setChatHistory] = useState([]);
+  const [language, setLanguage] = useState("en-IN");
 
   const [newTrigger, setNewTrigger] = useState("");
   const [newActionType, setNewActionType] = useState("launch_app");
@@ -34,8 +35,34 @@ export default function App() {
       fetchMacros();
       fetchAuditLogs();
       fetchChatHistory();
+      fetchSettings();
     }
   }, [currentView]);
+
+  const fetchSettings = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/settings`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.language) setLanguage(data.language);
+      }
+    } catch (err) {
+      console.error("Failed to fetch settings:", err);
+    }
+  };
+
+  const handleLanguageChange = async (newLang) => {
+    setLanguage(newLang);
+    try {
+      await fetch(`${API_BASE_URL}/settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ language: newLang }),
+      });
+    } catch (err) {
+      console.error("Failed to update language setting:", err);
+    }
+  };
 
   const fetchMacros = async () => {
     try {
@@ -98,6 +125,16 @@ export default function App() {
     }
   };
 
+  const handleStop = async () => {
+    try {
+      await fetch(`${API_BASE_URL}/stop`, { method: "POST" });
+    } catch (err) {
+      console.error("Stop command error:", err);
+    }
+    setStatus("KALKI: Stopped.");
+    setListening(false);
+  };
+
   const triggerBackendVoice = async () => {
     setListening(true);
     setStatus("Listening via Python Core Mic (4s)...");
@@ -105,13 +142,64 @@ export default function App() {
       const response = await fetch(`${API_BASE_URL}/listen-voice`, {
         method: "POST",
       });
-      const data = await response.json();
 
-      if (data.transcript) setTranscript(data.transcript);
+      if (!response.ok) {
+        throw new Error(`Server returned status ${response.status}`);
+      }
 
-      const responseText =
-        data.reply || data.executed || data.message || "Speech processed";
-      setStatus(`KALKI: ${responseText}`);
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const data = await response.json();
+        if (data.transcript) {
+          setTranscript(data.transcript);
+          setStatus(`Heard: ${data.transcript}`);
+          await new Promise((resolve) => setTimeout(resolve, 600));
+        }
+        const responseText =
+          data.reply || data.executed || data.message || "Speech processed";
+        setStatus(`KALKI: ${responseText}`);
+      } else if (response.body) {
+        // Handle SSE streaming voice response
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let accumulatedText = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop();
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed.startsWith("data: ")) {
+              const dataStr = trimmed.slice(6);
+              if (dataStr === "[DONE]") continue;
+
+              try {
+                const parsed = JSON.parse(dataStr);
+                if (parsed.status === "done") continue;
+                if (parsed.transcript) {
+                  setTranscript(parsed.transcript);
+                  setStatus(`Heard: ${parsed.transcript}`);
+                }
+                if (parsed.text) {
+                  accumulatedText = accumulatedText
+                    ? `${accumulatedText} ${parsed.text}`
+                    : parsed.text;
+                  setStatus(`KALKI: ${accumulatedText}`);
+                }
+              } catch (jsonErr) {
+                // Ignore non-json lines
+              }
+            }
+          }
+        }
+      }
+
       fetchAuditLogs();
       fetchChatHistory();
     } catch (err) {
@@ -147,10 +235,82 @@ export default function App() {
     }
   };
 
+  const sendStreamingCommandToBackend = async (commandText) => {
+    setStatus("KALKI: Thinking...");
+    let receivedAnyText = false;
+    let accumulatedText = "";
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/chat-stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command: commandText }),
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error(`Server returned status ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith("data: ")) {
+            const dataStr = trimmed.slice(6);
+            if (dataStr === "[DONE]") continue;
+
+            try {
+              const parsed = JSON.parse(dataStr);
+              if (parsed.status === "done") continue;
+              if (parsed.text) {
+                receivedAnyText = true;
+                accumulatedText = accumulatedText
+                  ? `${accumulatedText} ${parsed.text.trim()}`
+                  : parsed.text.trim();
+                setStatus(`KALKI: ${accumulatedText}`);
+              }
+            } catch (jsonErr) {
+              if (dataStr && !dataStr.startsWith("{")) {
+                receivedAnyText = true;
+                accumulatedText = accumulatedText
+                  ? `${accumulatedText} ${dataStr}`
+                  : dataStr;
+                setStatus(`KALKI: ${accumulatedText}`);
+              }
+            }
+          }
+        }
+      }
+
+      if (!receivedAnyText) {
+        await sendCommandToBackend(commandText);
+        return;
+      }
+
+      fetchAuditLogs();
+      fetchChatHistory();
+    } catch (err) {
+      console.warn("Streaming failed, falling back to /execute-command:", err);
+      if (!receivedAnyText) {
+        await sendCommandToBackend(commandText);
+      }
+    }
+  };
+
   const handleManualSubmit = (e) => {
     e.preventDefault();
     if (!manualCommand.trim()) return;
-    sendCommandToBackend(manualCommand);
+    sendStreamingCommandToBackend(manualCommand);
     setTranscript(manualCommand);
     setManualCommand("");
   };
@@ -319,6 +479,9 @@ export default function App() {
         fetchAuditLogs={fetchAuditLogs}
         chatHistory={chatHistory}
         fetchChatHistory={fetchChatHistory}
+        language={language}
+        handleLanguageChange={handleLanguageChange}
+        handleStop={handleStop}
       />
     );
   }

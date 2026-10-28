@@ -2,6 +2,9 @@ import os
 import re
 import subprocess
 import asyncio
+import threading
+import queue
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 import pyautogui
@@ -99,10 +102,48 @@ def fast_path_local_router(user_prompt: str):
 JARVIS_SYSTEM_INSTRUCTION = """
 You are KALKI, an autonomous multi-lingual J.A.R.V.I.S.-style AI core assistant.
 Rules:
-1. Detect user language (English, Kannada, Hindi, Kanglish) and respond naturally in the same language.
+1. Reply in English unless the user explicitly asks for another language (for example 'reply in Kannada') or the language setting is set to another language.
 2. Keep responses brief, sharp, concise, and authoritative.
 3. Provide direct answers to general knowledge questions.
 """
+
+def detect_reply_language(user_prompt: str) -> str:
+    """
+    Determines the reply language from the user prompt text.
+    Honors explicit instructions (e.g. 'reply in Kannada', 'in Hindi').
+    Detects scripts: Devanagari -> Hindi, Kannada -> Kannada.
+    Defaults to English.
+    """
+    prompt_lower = user_prompt.lower()
+    # Check for explicit language requests
+    if re.search(r'\b(?:reply|speak|answer|talk|respond)\s+in\s+kannada\b', prompt_lower) or "in kannada" in prompt_lower:
+        return "kannada"
+    if re.search(r'\b(?:reply|speak|answer|talk|respond)\s+in\s+hindi\b', prompt_lower) or "in hindi" in prompt_lower:
+        return "hindi"
+    if re.search(r'\b(?:reply|speak|answer|talk|respond)\s+in\s+english\b', prompt_lower) or "in english" in prompt_lower:
+        return "english"
+
+    # Script-based detection
+    if re.search(r'[\u0C80-\u0CFF]', user_prompt):
+        return "kannada"
+    if re.search(r'[\u0900-\u097F]', user_prompt):
+        return "hindi"
+
+    return "english"
+
+def get_language_instruction(lang: str) -> str:
+    """Returns the explicit language instruction to override default English."""
+    if lang == "hindi":
+        return "Reply only in Hindi (Devanagari script)."
+    elif lang == "kannada":
+        return "Reply only in Kannada (Kannada script)."
+    return "Reply in English."
+
+def build_system_instruction(user_prompt: str) -> str:
+    """Builds dynamic system prompt embedding detected reply language instruction."""
+    lang = detect_reply_language(user_prompt)
+    lang_instruction = get_language_instruction(lang)
+    return f"{JARVIS_SYSTEM_INSTRUCTION.strip()}\n\nExplicit Language Instruction:\n{lang_instruction}"
 
 def _call_gemini(user_prompt: str, chat_history: list = None) -> str:
     """Executes call to Google GenAI Gemini model with a 10s deadline."""
@@ -123,11 +164,12 @@ def _call_gemini(user_prompt: str, chat_history: list = None) -> str:
         types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)])
     )
 
+    system_inst = build_system_instruction(user_prompt)
     response = active_client.models.generate_content(
         model=model_name,
         contents=formatted_contents,
         config=types.GenerateContentConfig(
-            system_instruction=JARVIS_SYSTEM_INSTRUCTION,
+            system_instruction=system_inst,
             temperature=0.2,
             http_options=types.HttpOptions(timeout=10000),
         ),
@@ -144,7 +186,8 @@ def _call_groq(user_prompt: str, chat_history: list = None) -> str:
 
     model_name = os.getenv("GROQ_MODEL", "").strip() or DEFAULT_GROQ_MODEL
 
-    messages = [{"role": "system", "content": JARVIS_SYSTEM_INSTRUCTION}]
+    system_inst = build_system_instruction(user_prompt)
+    messages = [{"role": "system", "content": system_inst}]
     if chat_history:
         for msg in chat_history:
             messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
@@ -162,6 +205,90 @@ def _call_groq(user_prompt: str, chat_history: list = None) -> str:
         if content:
             return content.strip()
     return "I processed your request with Groq, but received an empty response."
+
+def _stream_groq(user_prompt: str, chat_history: list = None):
+    """Executes streaming call to Groq API with 10s timeout."""
+    active_groq = groq_client or get_groq_client()
+    if not active_groq:
+        raise ValueError("GROQ_API_KEY missing or client unavailable")
+
+    model_name = os.getenv("GROQ_MODEL", "").strip() or DEFAULT_GROQ_MODEL
+    system_inst = build_system_instruction(user_prompt)
+    messages = [{"role": "system", "content": system_inst}]
+    if chat_history:
+        for msg in chat_history:
+            messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+    messages.append({"role": "user", "content": user_prompt})
+
+    completion = active_groq.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=1024,
+        timeout=10.0,
+        stream=True,
+    )
+    for chunk in completion:
+        if chunk.choices and len(chunk.choices) > 0:
+            delta = chunk.choices[0].delta
+            content = getattr(delta, "content", None)
+            if content:
+                yield content
+
+def _stream_gemini(user_prompt: str, chat_history: list = None):
+    """Executes streaming call to Google GenAI Gemini model with 10s deadline."""
+    active_client = client or get_gemini_client()
+    if not active_client:
+        raise ValueError("GEMINI_API_KEY missing or client unavailable")
+
+    model_name = os.getenv("GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL
+    formatted_contents = []
+    if chat_history:
+        for msg in chat_history:
+            role = "user" if msg.get("role") == "user" else "model"
+            formatted_contents.append(
+                types.Content(role=role, parts=[types.Part.from_text(text=msg.get("content", ""))])
+            )
+    formatted_contents.append(
+        types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)])
+    )
+
+    system_inst = build_system_instruction(user_prompt)
+    response = active_client.models.generate_content_stream(
+        model=model_name,
+        contents=formatted_contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            temperature=0.2,
+            http_options=types.HttpOptions(timeout=10000),
+        ),
+    )
+    for chunk in response:
+        if chunk.text:
+            yield chunk.text
+
+async def _run_stream_in_thread(sync_gen_fn, *args):
+    """Runs a synchronous generator in a thread feeding a queue to avoid event-loop blocking."""
+    q = queue.Queue()
+    _DONE = object()
+
+    def worker():
+        try:
+            for item in sync_gen_fn(*args):
+                q.put(item)
+            q.put(_DONE)
+        except Exception as e:
+            q.put(e)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    while True:
+        item = await asyncio.to_thread(q.get)
+        if item is _DONE:
+            break
+        if isinstance(item, Exception):
+            raise item
+        yield item
 
 def _format_error_log(provider: str, err: Exception) -> str:
     """Format safe provider failure log without exposing secrets, request bodies, or error payloads."""
@@ -220,6 +347,94 @@ def process_jarvis_intent(user_prompt: str, chat_history: list = None) -> dict:
 async def process_jarvis_intent_async(user_prompt: str, chat_history: list = None) -> dict:
     """Non-blocking async wrapper that offloads blocking SDK calls to a worker thread."""
     return await asyncio.to_thread(process_jarvis_intent, user_prompt, chat_history)
+
+async def process_jarvis_intent_stream(
+    user_prompt: str,
+    chat_history: list = None,
+    cancel_event: Optional[asyncio.Event] = None,
+    request_start_time: Optional[float] = None
+):
+    """
+    Yields text chunks with streaming intent routing:
+    1. Local regex router (0ms local execution, yields reply as single chunk)
+    2. Primary: Groq streaming (10s timeout)
+    3. Fallback: Google Gemini streaming (10s timeout, if Groq fails before yielding)
+    4. Safe spoken error fallback
+    If streaming fails after chunks have started, stops and yields nothing more.
+    Checks cancel_event between chunks to stop immediately on user interruption.
+    """
+    if cancel_event and cancel_event.is_set():
+        return
+
+    # 1. 0ms Fast-Path Local Router
+    handled, result = fast_path_local_router(user_prompt)
+    if handled:
+        print("[LLM Engine] Provider: Local Regex Router")
+        yield result.get("reply", "")
+        return
+
+    chunks_yielded = 0
+
+    # 2. Primary: Groq streaming
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key and groq_key.strip():
+        try:
+            model_name = os.getenv("GROQ_MODEL", "").strip() or DEFAULT_GROQ_MODEL
+            provider_logged = False
+            async for chunk in _run_stream_in_thread(_stream_groq, user_prompt, chat_history):
+                if cancel_event and cancel_event.is_set():
+                    return
+                if not provider_logged:
+                    print(f"[LLM Engine] Provider: Groq ({model_name})")
+                    provider_logged = True
+                if chunks_yielded == 0 and request_start_time is not None:
+                    if os.getenv("DEBUG_TIMING", "0") == "1":
+                        token_ms = (time.perf_counter() - request_start_time) * 1000
+                        print(f"[TIMING] Time to first LLM token: {token_ms:.1f}ms", flush=True)
+                chunks_yielded += 1
+                yield chunk
+            return
+        except Exception as groq_err:
+            print(_format_error_log("groq", groq_err))
+            if chunks_yielded > 0:
+                # Stop and yield nothing more; do not restart and duplicate text
+                return
+    else:
+        print("[LLM] groq failed: ValueError status=missing_key")
+
+    if cancel_event and cancel_event.is_set():
+        return
+
+    # 3. Fallback: Gemini streaming (only if chunks_yielded == 0)
+    if chunks_yielded == 0:
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if gemini_key and gemini_key.strip():
+            try:
+                model_name = os.getenv("GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL
+                provider_logged = False
+                async for chunk in _run_stream_in_thread(_stream_gemini, user_prompt, chat_history):
+                    if cancel_event and cancel_event.is_set():
+                        return
+                    if not provider_logged:
+                        print(f"[LLM Engine] Provider: Gemini ({model_name}) [Fallback]")
+                        provider_logged = True
+                    if chunks_yielded == 0 and request_start_time is not None:
+                        if os.getenv("DEBUG_TIMING", "0") == "1":
+                            token_ms = (time.perf_counter() - request_start_time) * 1000
+                            print(f"[TIMING] Time to first LLM token: {token_ms:.1f}ms", flush=True)
+                    chunks_yielded += 1
+                    yield chunk
+                return
+            except Exception as gemini_err:
+                print(_format_error_log("gemini", gemini_err))
+                if chunks_yielded > 0:
+                    return
+        else:
+            print("[LLM] gemini failed: ValueError status=missing_key")
+
+    # 4. Safe spoken error message fallback (if chunks_yielded == 0)
+    if chunks_yielded == 0 and (not cancel_event or not cancel_event.is_set()):
+        yield "I am having trouble connecting to cloud services right now. Please check your internet connection or API keys."
 
 def click_at_coordinates(x: int, y: int) -> str:
     """Clicks directly on desktop screen coordinates (x, y)."""
