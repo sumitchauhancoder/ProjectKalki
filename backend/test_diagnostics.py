@@ -689,12 +689,48 @@ def run_all_checks():
         all_passed = False
 
     # --------------------------------------------------------------------------
-    # Check 15: TTS Prefetch Architecture, Cancellation Purge, and Single Sentence Cleanup
+    # Check 15: Single Full-Reply TTS, Voice System Instruction, Stop Cancellation, and Router
     # --------------------------------------------------------------------------
-    print("\n[Check 15] TTS Prefetch Architecture, Cancellation, and Single Sentence Cleanup:")
+    print("\n[Check 15] Single Full-Reply TTS, Voice System Instruction, and File Cleanup:")
     try:
         import tts_engine
         import asyncio
+
+        # 15a. Voice instruction added only for voice requests, not typed
+        voice_prompt = "भारत की राजधानी क्या है?"
+        voice_inst = llm_engine.build_system_instruction(voice_prompt, is_voice=True)
+        typed_inst = llm_engine.build_system_instruction(voice_prompt, is_voice=False)
+        expected_voice_rule = "For voice replies, answer in at most 2 short sentences unless the user asks for detail."
+        assert expected_voice_rule in voice_inst, f"Voice instruction missing: {voice_inst}"
+        assert expected_voice_rule not in typed_inst, f"Voice instruction unexpectedly found in typed prompt: {typed_inst}"
+        print("  15a. Voice system instruction present only when is_voice=True; omitted for typed.")
+
+        # 15b. Whole reply is sent to TTS once, not per sentence
+        from fastapi.testclient import TestClient
+        import numpy as np
+        client = TestClient(app, raise_server_exceptions=False)
+
+        spoken_calls = []
+        async def mock_speak_text(text, request_start_time=None):
+            spoken_calls.append(text)
+
+        def mock_stream_3_sentences(*args, **kwargs):
+            yield "Sentence one. "
+            yield "Sentence two. "
+            yield "Sentence three."
+
+        dummy_audio = np.zeros(16000 * 4, dtype=np.int16)
+        with patch("sounddevice.rec", return_value=dummy_audio), patch("sounddevice.wait"), \
+             patch("app.recognize_speech", return_value="Tell me three facts"), \
+             patch("app.speak_text", mock_speak_text), \
+             patch.object(llm_engine, "_stream_groq", mock_stream_3_sentences), \
+             patch.dict(os.environ, {"GROQ_API_KEY": "dummy_key"}):
+            spoken_calls.clear()
+            res_voice = client.post("/listen-voice", headers={"Accept": "text/event-stream"})
+            assert res_voice.status_code == 200
+            assert len(spoken_calls) == 1, f"Expected 1 TTS call for full reply, got {len(spoken_calls)}: {spoken_calls}"
+            assert spoken_calls[0] == "Sentence one. Sentence two. Sentence three."
+        print("  15b. Whole streaming reply is sent to TTS exactly once as a single request, not per sentence.")
 
         # Read sample dummy bytes for fast unit test execution without network calls
         sample_mp3_path = Path(os.environ.get("APPDATA", "")) / "KALKI" / "debug_audio" / "live" / "live_001.mp3"
@@ -703,57 +739,8 @@ def run_all_checks():
         else:
             sample_mp3_bytes = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\x00" * 2000
 
-        # 15a. Prefetch starts sentence N+1 before sentence N finishes playing
-        async def _test_prefetch_starts_ahead():
-            tts_engine.reset_cancel()
-            tts_engine.playback_hook = None
-            synth_events = []
-            play_events = []
-            synth_count = 0
-            play_count = 0
-
-            async def mock_communicate_save(self, path):
-                nonlocal synth_count
-                synth_count += 1
-                idx = synth_count
-                t_start = time.perf_counter()
-                synth_events.append((f"start_synth_{idx}", t_start))
-                Path(path).write_bytes(sample_mp3_bytes)
-                await asyncio.sleep(0.04)
-                t_end = time.perf_counter()
-                synth_events.append((f"end_synth_{idx}", t_end))
-
-            async def mock_play_file(path_str):
-                nonlocal play_count
-                play_count += 1
-                idx = play_count
-                t_start = time.perf_counter()
-                play_events.append((f"start_play_{idx}", t_start))
-                await asyncio.sleep(0.18)
-                t_end = time.perf_counter()
-                play_events.append((f"end_play_{idx}", t_end))
-
-            with patch("edge_tts.Communicate.save", mock_communicate_save), \
-                 patch.object(tts_engine, "_play_file_persistent", mock_play_file):
-                q = tts_engine.get_tts_queue()
-                await tts_engine.enqueue_speech("Sentence number one.")
-                await tts_engine.enqueue_speech("Sentence number two.")
-                await q.join()
-
-            start_play_1 = dict(play_events)["start_play_1"]
-            end_play_1 = dict(play_events)["end_play_1"]
-            start_synth_2 = dict(synth_events)["start_synth_2"]
-
-            assert start_synth_2 < end_play_1, (
-                f"Prefetch failed: Sentence 2 synthesis started at {start_synth_2:.3f}, "
-                f"after Sentence 1 playback ended at {end_play_1:.3f}"
-            )
-
-        asyncio.run(_test_prefetch_starts_ahead())
-        print("  15a. Prefetch starts sentence N+1 while sentence N is still playing.")
-
-        # 15b. Stop cancels prefetched jobs and deletes their files
-        async def _test_stop_cancels_and_deletes_files():
+        # 15c. Stop cancels speech and deletes the file
+        async def _test_stop_cancels_and_deletes():
             tts_engine.reset_cancel()
             tts_engine.playback_hook = None
             created_files = []
@@ -761,7 +748,7 @@ def run_all_checks():
             async def mock_communicate_save(self, path):
                 created_files.append(Path(path))
                 Path(path).write_bytes(sample_mp3_bytes)
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.01)
 
             play_started = asyncio.Event()
             play_stopped = asyncio.Event()
@@ -777,28 +764,24 @@ def run_all_checks():
             with patch("edge_tts.Communicate.save", mock_communicate_save), \
                  patch.object(tts_engine, "_play_file_persistent", mock_play_file):
                 q = tts_engine.get_tts_queue()
-                await tts_engine.enqueue_speech("Sentence one is starting.")
-                await tts_engine.enqueue_speech("Sentence two is prefetched.")
-                await tts_engine.enqueue_speech("Sentence three is queued.")
+                await tts_engine.enqueue_speech("Full reply to be interrupted.")
 
                 await play_started.wait()
-                await asyncio.sleep(0.08)
-
-                assert len(created_files) >= 2, f"Expected at least 2 files created, got {len(created_files)}"
-                prefetched_file = created_files[1]
-                assert prefetched_file.exists(), "Prefetched file does not exist before cancel"
+                assert len(created_files) == 1
+                active_file = created_files[0]
+                assert active_file.exists(), "Active file does not exist during playback"
 
                 tts_engine.cancel_playback_and_queue()
                 assert tts_engine.is_cancelled()
                 await play_stopped.wait()
 
-                assert not prefetched_file.exists(), f"Prefetched file {prefetched_file} was not unlinked on cancel!"
+                assert not active_file.exists(), f"File {active_file} was not unlinked on cancel!"
 
-        asyncio.run(_test_stop_cancels_and_deletes_files())
-        print("  15b. Stop cancels prefetched jobs and unlinks all prefetched audio files.")
+        asyncio.run(_test_stop_cancels_and_deletes())
+        print("  15c. Stop cancels active speech and immediately unlinks the audio file.")
 
-        # 15c. Single-sentence reply still plays and deletes its file cleanly
-        async def _test_single_sentence_plays_and_cleans():
+        # 15d. Single speech job plays completely and deletes file cleanly
+        async def _test_single_reply_plays_and_cleans():
             tts_engine.reset_cancel()
             tts_engine.playback_hook = None
             created_files = []
@@ -816,15 +799,140 @@ def run_all_checks():
             with patch("edge_tts.Communicate.save", mock_communicate_save), \
                  patch.object(tts_engine, "_play_file_persistent", mock_play_file):
                 q = tts_engine.get_tts_queue()
-                await tts_engine.enqueue_speech("Single standalone sentence.")
+                await tts_engine.enqueue_speech("Single full spoken reply.")
                 await q.join()
 
             assert len(played_files) == 1, f"Expected 1 played file, got {len(played_files)}"
             assert len(created_files) == 1, f"Expected 1 created file, got {len(created_files)}"
             assert not created_files[0].exists(), f"File {created_files[0]} was not unlinked after playback!"
 
-        asyncio.run(_test_single_sentence_plays_and_cleans())
-        print("  15c. Single-sentence reply plays completely and deletes file cleanly.")
+        asyncio.run(_test_single_reply_plays_and_cleans())
+        print("  15d. Single full reply plays completely and unlinks file cleanly.")
+
+        # 15e. Local router still answers 'open calculator' with zero cloud calls
+        with patch.object(llm_engine, "_call_groq") as mock_groq, \
+             patch.object(llm_engine, "_call_gemini") as mock_gemini:
+            calc_res = client.post("/execute-command", json={"command": "open calculator"})
+            assert calc_res.status_code == 200
+            assert not mock_groq.called and not mock_gemini.called, "Cloud LLM invoked for local router command!"
+            calc_data = calc_res.json()
+            assert "Launched calculator" in calc_data.get("reply", "")
+        print("  15e. Local router still answers 'open calculator' with zero cloud calls.")
+        print("  PASS")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"  FAIL — {e}")
+        all_passed = False
+
+    # --------------------------------------------------------------------------
+    # Check 16: Group 1 Local Router & System Control Commands
+    # --------------------------------------------------------------------------
+    print("\n[Check 16] Group 1 Local System & App Control Commands:")
+    try:
+        from unittest.mock import MagicMock
+
+        # 16a. "open calculator" matches the router and calls subprocess.Popen with calc.exe
+        with patch("subprocess.Popen") as mock_popen, \
+             patch.object(llm_engine, "_call_groq") as mock_groq, \
+             patch.object(llm_engine, "_call_gemini") as mock_gemini:
+            res_calc = llm_engine.process_jarvis_intent("open calculator")
+            assert not mock_groq.called and not mock_gemini.called, "Cloud LLM called for open calculator!"
+            assert mock_popen.called, "subprocess.Popen was not called for open calculator!"
+            args, _ = mock_popen.call_args
+            assert "calc.exe" in str(args) or "calc" in str(args), f"calc.exe not in Popen args: {args}"
+            assert "Launched calculator" in res_calc.get("reply", "")
+        print("  16a. 'open calculator' matches router and calls Popen with calc.exe.")
+
+        # 16b. "close notepad" calls taskkill with notepad.exe
+        with patch("subprocess.run") as mock_run, \
+             patch.object(llm_engine, "_call_groq") as mock_groq, \
+             patch.object(llm_engine, "_call_gemini") as mock_gemini:
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_run.return_value = mock_proc
+            res_close = llm_engine.process_jarvis_intent("close notepad")
+            assert not mock_groq.called and not mock_gemini.called, "Cloud LLM called for close notepad!"
+            assert mock_run.called, "subprocess.run was not called for close notepad!"
+            run_args, _ = mock_run.call_args
+            assert "taskkill" in run_args[0] and "notepad.exe" in run_args[0], f"taskkill notepad.exe not in args: {run_args}"
+            assert "Closed notepad." in res_close.get("reply", "")
+        print("  16b. 'close notepad' calls taskkill with notepad.exe without calling LLM.")
+
+        # 16c. "open malware.exe" does NOT match and goes to the LLM
+        with patch.object(llm_engine, "_call_groq", return_value="I cannot open unverified executables.") as mock_groq, \
+             patch.object(llm_engine, "_call_gemini") as mock_gemini:
+            res_malware = llm_engine.process_jarvis_intent("open malware.exe")
+            assert mock_groq.called, "Cloud LLM was NOT called for unauthorized app 'open malware.exe'!"
+            assert "I cannot open unverified executables." in res_malware.get("reply", "")
+        print("  16c. 'open malware.exe' is blocked by allowlist and safely routes to LLM.")
+
+        # 16d. "volume up" does not call the LLM
+        with patch.object(llm_engine, "get_volume_interface") as mock_vol_iface, \
+             patch.object(llm_engine, "_call_groq") as mock_groq, \
+             patch.object(llm_engine, "_call_gemini") as mock_gemini:
+            mock_vol = MagicMock()
+            mock_vol.GetMasterVolumeLevelScalar.return_value = 0.50
+            mock_vol_iface.return_value = mock_vol
+            res_vol = llm_engine.process_jarvis_intent("volume up")
+            assert not mock_groq.called and not mock_gemini.called, "Cloud LLM called for volume up!"
+            assert mock_vol.SetMasterVolumeLevelScalar.called, "SetMasterVolumeLevelScalar was not called!"
+            assert "Volume increased." in res_vol.get("reply", "")
+        print("  16d. 'volume up' adjusts audio and returns without calling LLM.")
+
+        # 16e. "set volume to 75" extracts 75 correctly
+        with patch.object(llm_engine, "get_volume_interface") as mock_vol_iface, \
+             patch.object(llm_engine, "_call_groq") as mock_groq, \
+             patch.object(llm_engine, "_call_gemini") as mock_gemini:
+            mock_vol = MagicMock()
+            mock_vol_iface.return_value = mock_vol
+            res_vol_75 = llm_engine.process_jarvis_intent("set volume to 75")
+            assert not mock_groq.called and not mock_gemini.called, "Cloud LLM called for set volume to 75!"
+            mock_vol.SetMasterVolumeLevelScalar.assert_called_with(0.75, None)
+            assert "Volume set to 75 percent." in res_vol_75.get("reply", "")
+        print("  16e. 'set volume to 75' accurately parses 75 and sets scalar 0.75.")
+
+        # 16f. "shutdown" sets _pending_action to "shutdown"
+        llm_engine._pending_action = None
+        with patch.object(llm_engine, "_call_groq") as mock_groq:
+            res_shut = llm_engine.process_jarvis_intent("shutdown")
+            assert not mock_groq.called, "Cloud LLM called for shutdown initiation!"
+            assert llm_engine._pending_action == "shutdown", f"Expected _pending_action=='shutdown', got {llm_engine._pending_action}"
+            assert "Say yes to confirm" in res_shut.get("reply", "")
+        print("  16f. 'shutdown' sets _pending_action to 'shutdown' and prompts confirmation.")
+
+        # 16g. "yes" after shutdown executes the shutdown command
+        with patch("subprocess.Popen") as mock_popen, \
+             patch.object(llm_engine, "_call_groq") as mock_groq:
+            res_yes = llm_engine.process_jarvis_intent("yes")
+            assert not mock_groq.called, "Cloud LLM called for confirmation 'yes'!"
+            assert mock_popen.called, "subprocess.Popen not called upon confirmed shutdown!"
+            pop_args, _ = mock_popen.call_args
+            assert "shutdown" in str(pop_args) and "/s" in str(pop_args), f"shutdown /s not in args: {pop_args}"
+            assert llm_engine._pending_action is None, "Pending action was not cleared after confirmation!"
+        print("  16g. 'yes' executes confirmed shutdown command and clears pending state.")
+
+        # 16h. "no" after shutdown clears _pending_action
+        llm_engine._pending_action = "shutdown"
+        llm_engine._pending_action_timestamp = time.time()
+        with patch("subprocess.Popen") as mock_popen, \
+             patch.object(llm_engine, "_call_groq") as mock_groq:
+            res_no = llm_engine.process_jarvis_intent("no")
+            assert not mock_groq.called, "Cloud LLM called for cancellation 'no'!"
+            assert not mock_popen.called, "subprocess.Popen was called on cancelled shutdown!"
+            assert llm_engine._pending_action is None, "Pending action was not cleared after 'no'!"
+            assert "Cancelled." in res_no.get("reply", "")
+        print("  16h. 'no' clears _pending_action and cancels shutdown with 'Cancelled.'")
+
+        # 16i. "take a screenshot" does not call the LLM
+        with patch.object(llm_engine, "take_screenshot", return_value="Screenshot saved to Pictures/KALKI Screenshots/kalki_2026-10-28_12-00-00.png") as mock_shot, \
+             patch.object(llm_engine, "_call_groq") as mock_groq, \
+             patch.object(llm_engine, "_call_gemini") as mock_gemini:
+            res_shot = llm_engine.process_jarvis_intent("take a screenshot")
+            assert not mock_groq.called and not mock_gemini.called, "Cloud LLM called for take screenshot!"
+            assert mock_shot.called, "take_screenshot was not invoked!"
+            assert "Screenshot saved to" in res_shot.get("reply", "")
+        print("  16i. 'take a screenshot' captures screen without calling LLM.")
         print("  PASS")
     except Exception as e:
         import traceback
@@ -837,7 +945,7 @@ def run_all_checks():
     # --------------------------------------------------------------------------
     print("\n" + "=" * 70)
     if all_passed:
-        print("ALL 15 DIAGNOSTICS & SAFETY CHECKS PASSED [PASS]")
+        print("ALL 16 DIAGNOSTICS & SAFETY CHECKS PASSED [PASS]")
         print("=" * 70)
         sys.exit(0)
     else:

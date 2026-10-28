@@ -5,6 +5,8 @@ import asyncio
 import threading
 import queue
 import time
+import shutil
+from typing import Optional, Dict, Any
 from pathlib import Path
 from dotenv import load_dotenv
 import pyautogui
@@ -22,19 +24,59 @@ load_dotenv(dotenv_path=env_path)
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"  # Verify in https://ai.google.dev/gemini-api/docs/models
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"  # Verify in https://console.groq.com/docs/models
 
-APP_MAP = {
-    "calculator": "calc",
-    "calc": "calc",
-    "notepad": "notepad",
-    "cmd": "cmd",
-    "command prompt": "cmd",
-    "terminal": "wt",
+# --------------------------------------------------------------------------
+# Group 1: Local System and App Control Configuration (APP_COMMANDS)
+# --------------------------------------------------------------------------
+APP_COMMANDS = {
+    # Text & Code Editors
+    "notepad": "notepad.exe",
     "vs code": "code",
     "vscode": "code",
+    "visual studio code": "code",
     "code": "code",
-    "chrome": "start chrome",
-    "browser": "start https://google.com"
+
+    # Browsers
+    "chrome": "chrome.exe",
+    "google chrome": "chrome.exe",
+    "firefox": "firefox.exe",
+    "brave": "brave.exe",
+    "edge": "msedge.exe",
+
+    # Calculators & System Utilities
+    "calculator": "calc.exe",
+    "calc": "calc.exe",
+    "terminal": "wt.exe",
+    "cmd": "cmd.exe",
+    "command prompt": "cmd.exe",
+    "powershell": "powershell.exe",
+    "file explorer": "explorer.exe",
+    "explorer": "explorer.exe",
+    "my computer": "explorer.exe",
+    "this pc": "explorer.exe",
+    "task manager": "taskmgr.exe",
+    "settings": "ms-settings:",
+    "windows settings": "ms-settings:",
+    "paint": "mspaint.exe",
+    "mspaint": "mspaint.exe",
+
+    # Productivity / Office Suite
+    "word": "winword.exe",
+    "excel": "excel.exe",
+    "powerpoint": "powerpnt.exe",
+    "outlook": "outlook.exe",
+
+    # Media & Communication
+    "spotify": "spotify.exe",
+    "vlc": "vlc.exe",
+    "zoom": "zoom.exe",
+    "teams": "teams.exe",
+    "discord": "discord.exe",
 }
+
+APP_MAP = APP_COMMANDS
+
+_pending_action: Optional[str] = None
+_pending_action_timestamp: float = 0.0
 
 def get_gemini_client():
     """Initializes Google GenAI client if GEMINI_API_KEY is available."""
@@ -63,35 +105,384 @@ def get_groq_client():
 client = get_gemini_client()
 groq_client = get_groq_client()
 
+def find_app_executable(exe_name: str) -> Optional[str]:
+    """Finds path to executable on PATH, Windows Registry, or common install locations."""
+    if not exe_name or exe_name.startswith("ms-settings:"):
+        return exe_name
+
+    found = shutil.which(exe_name)
+    if found:
+        return found
+
+    try:
+        import winreg
+        for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            try:
+                sub_key = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}"
+                with winreg.OpenKey(root, sub_key) as k:
+                    val, _ = winreg.QueryValueEx(k, "")
+                    if val and Path(val).exists():
+                        return val
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    prog_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    prog_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    app_data = os.environ.get("APPDATA", "")
+
+    candidates = [
+        Path(prog_files) / exe_name,
+        Path(prog_files_x86) / exe_name,
+    ]
+    if local_app_data:
+        candidates.extend([
+            Path(local_app_data) / "Programs" / exe_name,
+            Path(local_app_data) / "Microsoft" / "WindowsApps" / exe_name,
+        ])
+    if app_data:
+        candidates.append(Path(app_data) / exe_name)
+
+    for c in candidates:
+        if c.exists():
+            return str(c)
+
+    return None
+
 def launch_application(app_name: str) -> str:
     clean_name = app_name.lower().strip()
-    target = APP_MAP.get(clean_name, clean_name)
+    if clean_name not in APP_COMMANDS:
+        return f"I couldn't find {app_name} installed on this computer."
+
+    exe_target = APP_COMMANDS[clean_name]
+
+    if exe_target == "ms-settings:":
+        try:
+            subprocess.Popen(["explorer.exe", "ms-settings:"])
+            return "Opening settings."
+        except Exception:
+            return "I couldn't find settings installed on this computer."
+
+    resolved = find_app_executable(exe_target)
+    target = resolved or exe_target
+
     try:
-        subprocess.Popen(target, shell=True)
-        return f"Launched {app_name}"
+        if resolved is None and clean_name in ["word", "excel", "powerpoint", "outlook", "spotify", "vlc", "zoom", "teams", "discord"]:
+            if not shutil.which(exe_target):
+                raise FileNotFoundError(f"{exe_target} not found")
+
+        subprocess.Popen([target])
+        if clean_name in ["calculator", "calc"]:
+            return f"Launched {clean_name}"
+        return f"Opening {app_name}."
+    except FileNotFoundError:
+        return f"I couldn't find {app_name} installed on this computer."
     except Exception as e:
         return f"Failed to launch {app_name}: {str(e)}"
 
-def fast_path_local_router(user_prompt: str):
-    """0ms Instant local execution."""
-    prompt = user_prompt.lower().strip()
+def close_application(app_name: str) -> str:
+    clean_name = app_name.lower().strip()
+    if clean_name not in APP_COMMANDS:
+        return f"I couldn't find {app_name} running."
 
+    exe_target = APP_COMMANDS[clean_name]
+    if exe_target == "ms-settings:":
+        exe_target = "SystemSettings.exe"
+    elif exe_target == "code":
+        exe_target = "Code.exe"
+
+    if not exe_target.lower().endswith(".exe"):
+        exe_name = f"{exe_target}.exe"
+    else:
+        exe_name = exe_target
+
+    try:
+        proc = subprocess.run(["taskkill", "/IM", exe_name, "/F"], capture_output=True, text=True)
+        if proc.returncode == 0:
+            return f"Closed {app_name}."
+        else:
+            return f"I couldn't find {app_name} running."
+    except Exception:
+        return f"I couldn't find {app_name} running."
+
+def get_volume_interface():
+    """Returns the pycaw audio endpoint volume controller."""
+    from pycaw.pycaw import AudioUtilities
+    speakers = AudioUtilities.GetSpeakers()
+    if hasattr(speakers, "EndpointVolume"):
+        return speakers.EndpointVolume
+    elif hasattr(speakers, "Activate"):
+        from pycaw.pycaw import IAudioEndpointVolume
+        from ctypes import cast, POINTER
+        from comtypes import CLSCTX_ALL
+        interface = speakers.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        return cast(interface, POINTER(IAudioEndpointVolume))
+    return speakers
+
+def handle_volume_control(prompt: str) -> Optional[str]:
+    """Processes volume adjustment and mute commands."""
+    if prompt in ["mute", "mute volume", "silence"]:
+        try:
+            vol = get_volume_interface()
+            vol.SetMute(1, None)
+            return "Volume muted."
+        except Exception as e:
+            return f"Failed to mute volume: {e}"
+
+    if prompt in ["unmute", "unmute volume"]:
+        try:
+            vol = get_volume_interface()
+            vol.SetMute(0, None)
+            return "Volume unmuted."
+        except Exception as e:
+            return f"Failed to unmute volume: {e}"
+
+    set_match = re.search(r'\b(?:set\s+volume\s+(?:to\s+)?|volume\s+to\s+|volume\s+)(\d{1,3})\b', prompt)
+    if not set_match:
+        set_match = re.search(r'\b(\d{1,3})\s*(?:percent\s+volume|%\s*volume)\b', prompt)
+
+    if set_match:
+        val = int(set_match.group(1))
+        val = max(0, min(100, val))
+        try:
+            vol = get_volume_interface()
+            vol.SetMasterVolumeLevelScalar(val / 100.0, None)
+            return f"Volume set to {val} percent."
+        except Exception as e:
+            return f"Failed to set volume: {e}"
+
+    if prompt in ["volume up", "increase volume", "louder", "turn volume up", "turn it up"]:
+        try:
+            vol = get_volume_interface()
+            cur = vol.GetMasterVolumeLevelScalar()
+            new_val = min(1.0, cur + 0.10)
+            vol.SetMasterVolumeLevelScalar(new_val, None)
+            return "Volume increased."
+        except Exception as e:
+            return f"Failed to increase volume: {e}"
+
+    if prompt in ["volume down", "decrease volume", "quieter", "lower volume", "turn volume down", "turn it down"]:
+        try:
+            vol = get_volume_interface()
+            cur = vol.GetMasterVolumeLevelScalar()
+            new_val = max(0.0, cur - 0.10)
+            vol.SetMasterVolumeLevelScalar(new_val, None)
+            return "Volume decreased."
+        except Exception as e:
+            return f"Failed to decrease volume: {e}"
+
+    return None
+
+def handle_brightness_control(prompt: str) -> Optional[str]:
+    """Processes monitor screen brightness commands."""
+    set_br_match = re.search(r'\b(?:set\s+brightness\s+(?:to\s+)?|brightness\s+to\s+|brightness\s+)(\d{1,3})\b', prompt)
+    if not set_br_match:
+        set_br_match = re.search(r'\b(\d{1,3})\s*(?:percent\s+brightness|%\s*brightness)\b', prompt)
+
+    if set_br_match:
+        val = int(set_br_match.group(1))
+        val = max(0, min(100, val))
+        try:
+            import screen_brightness_control as sbc
+            sbc.set_brightness(val)
+            return f"Brightness set to {val} percent."
+        except Exception:
+            return "Brightness control is not supported on this machine."
+
+    if prompt in ["brightness up", "increase brightness", "more brightness", "turn brightness up"]:
+        try:
+            import screen_brightness_control as sbc
+            cur_list = sbc.get_brightness()
+            cur = cur_list[0] if (isinstance(cur_list, list) and cur_list) else 50
+            new_val = min(100, cur + 10)
+            sbc.set_brightness(new_val)
+            return "Brightness increased."
+        except Exception:
+            return "Brightness control is not supported on this machine."
+
+    if prompt in ["brightness down", "decrease brightness", "lower brightness", "less brightness", "turn brightness down"]:
+        try:
+            import screen_brightness_control as sbc
+            cur_list = sbc.get_brightness()
+            cur = cur_list[0] if (isinstance(cur_list, list) and cur_list) else 50
+            new_val = max(0, cur - 10)
+            sbc.set_brightness(new_val)
+            return "Brightness decreased."
+        except Exception:
+            return "Brightness control is not supported on this machine."
+
+    return None
+
+def take_screenshot() -> str:
+    """Takes a full screen screenshot and saves it to %USERPROFILE%/Pictures/KALKI Screenshots/."""
+    from datetime import datetime
+    user_profile = os.environ.get("USERPROFILE", str(Path.home()))
+    folder = Path(user_profile) / "Pictures" / "KALKI Screenshots"
+    folder.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"kalki_{timestamp}.png"
+    filepath = folder / filename
+
+    saved = False
+    try:
+        import mss
+        with mss.mss() as sct:
+            sct.shot(output=str(filepath))
+            saved = filepath.exists()
+    except Exception:
+        saved = False
+
+    if not saved:
+        try:
+            from PIL import ImageGrab
+            img = ImageGrab.grab()
+            img.save(str(filepath))
+            saved = True
+        except Exception:
+            try:
+                import pyautogui
+                img = pyautogui.screenshot()
+                img.save(str(filepath))
+                saved = True
+            except Exception as e:
+                return f"Failed to take screenshot: {e}"
+
+    return f"Screenshot saved to Pictures/KALKI Screenshots/{filename}"
+
+def fast_path_local_router(user_prompt: str):
+    """0ms Instant local execution for Group 1 app and system control commands."""
+    global _pending_action, _pending_action_timestamp
+    prompt = user_prompt.lower().strip()
+    now = time.time()
+
+    # Expire pending action after 30 seconds
+    if _pending_action is not None and (now - _pending_action_timestamp > 30.0):
+        _pending_action = None
+
+    # Handle confirmation or cancellation if an action is pending
+    if _pending_action is not None:
+        action = _pending_action
+        if prompt in ["yes", "confirm", "okay", "ok", "yep", "yeah", "yes please", "sure"]:
+            _pending_action = None
+            if action == "shutdown":
+                subprocess.Popen(["shutdown", "/s", "/t", "5"])
+                return True, {"reply": "Shutting down in 5 seconds.", "tool_executed": "Fast-Path Local: shutdown"}
+            elif action == "restart":
+                subprocess.Popen(["shutdown", "/r", "/t", "5"])
+                return True, {"reply": "Restarting in 5 seconds.", "tool_executed": "Fast-Path Local: restart"}
+        elif prompt in ["no", "cancel", "stop", "abort", "nope", "never mind", "dont", "don't"]:
+            _pending_action = None
+            return True, {"reply": "Cancelled.", "tool_executed": "Fast-Path Local: cancel_pending_action"}
+
+    # Identity queries
     if prompt in ["who are you", "who are you?", "what is your name", "what is your name?"]:
         return True, {
             "reply": "I am KALKI, your autonomous multi-lingual desktop AI core assistant.",
             "tool_executed": "Local Identity Engine"
         }
 
-    match = re.search(r'\b(open|launch|start|run)\s+(now\s+)?([a-z0-9\s]+)', prompt)
-    if match:
-        target_app = match.group(3).strip()
-        for app_key in APP_MAP.keys():
-            if app_key in target_app:
-                res = launch_application(app_key)
-                return True, {"reply": res, "tool_executed": f"Fast-Path Local: {res}"}
-        res = launch_application(target_app)
+    # Volume control commands
+    vol_res = handle_volume_control(prompt)
+    if vol_res:
+        return True, {"reply": vol_res, "tool_executed": f"Fast-Path Local: {vol_res}"}
+
+    # Brightness control commands
+    bright_res = handle_brightness_control(prompt)
+    if bright_res:
+        return True, {"reply": bright_res, "tool_executed": f"Fast-Path Local: {bright_res}"}
+
+    # Shutdown initiation
+    if prompt in ["shutdown", "shut down", "turn off computer", "turn off pc", "power off"]:
+        _pending_action = "shutdown"
+        _pending_action_timestamp = time.time()
+        return True, {
+            "reply": "Are you sure you want to shut down? Say yes to confirm.",
+            "tool_executed": "Fast-Path Local: shutdown_confirmation_request"
+        }
+
+    # Restart initiation
+    if prompt in ["restart", "reboot", "restart computer", "restart pc"]:
+        _pending_action = "restart"
+        _pending_action_timestamp = time.time()
+        return True, {
+            "reply": "Are you sure you want to restart? Say yes to confirm.",
+            "tool_executed": "Fast-Path Local: restart_confirmation_request"
+        }
+
+    # Abort/cancel shutdown
+    if prompt in ["cancel shutdown", "abort shutdown"]:
+        _pending_action = None
+        try:
+            subprocess.Popen(["shutdown", "/a"])
+        except Exception:
+            pass
+        return True, {
+            "reply": "Shutdown cancelled.",
+            "tool_executed": "Fast-Path Local: abort_shutdown"
+        }
+
+    # Lock screen
+    if prompt in ["lock screen", "lock computer", "lock pc"]:
+        try:
+            subprocess.Popen(["rundll32.exe", "user32.dll,LockWorkStation"])
+            return True, {"reply": "Locking screen.", "tool_executed": "Fast-Path Local: lock_workstation"}
+        except Exception as e:
+            return True, {"reply": f"Failed to lock screen: {e}", "tool_executed": "Fast-Path Local: lock_workstation"}
+
+    # Sleep
+    if prompt in ["sleep", "sleep mode", "put computer to sleep"]:
+        try:
+            subprocess.Popen(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"])
+            return True, {"reply": "Putting computer to sleep.", "tool_executed": "Fast-Path Local: sleep"}
+        except Exception as e:
+            return True, {"reply": f"Failed to put computer to sleep: {e}", "tool_executed": "Fast-Path Local: sleep"}
+
+    # Screenshot
+    if prompt in ["take a screenshot", "screenshot", "capture screen", "take screenshot"]:
+        res = take_screenshot()
         return True, {"reply": res, "tool_executed": f"Fast-Path Local: {res}"}
 
+    # App Open / Launch
+    open_match = re.search(r'^(?:please\s+)?(?:open|launch|start|run)\s+(?:up\s+)?(?:the\s+)?([a-z0-9\s\.\-_]+)$', prompt)
+    if open_match:
+        target_raw = open_match.group(1).strip()
+        matched_app = None
+        for app_name in sorted(APP_COMMANDS.keys(), key=len, reverse=True):
+            if target_raw == app_name or target_raw == f"the {app_name}":
+                matched_app = app_name
+                break
+        if not matched_app:
+            for app_name in sorted(APP_COMMANDS.keys(), key=len, reverse=True):
+                if app_name in target_raw.split():
+                    matched_app = app_name
+                    break
+
+        if matched_app:
+            res = launch_application(matched_app)
+            return True, {"reply": res, "tool_executed": f"Fast-Path Local: {res}"}
+
+    # App Close / Exit
+    close_match = re.search(r'^(?:please\s+)?(?:close|exit|quit|kill|terminate)\s+(?:the\s+)?([a-z0-9\s\.\-_]+)$', prompt)
+    if close_match:
+        target_raw = close_match.group(1).strip()
+        matched_app = None
+        for app_name in sorted(APP_COMMANDS.keys(), key=len, reverse=True):
+            if target_raw == app_name or target_raw == f"the {app_name}":
+                matched_app = app_name
+                break
+        if not matched_app:
+            for app_name in sorted(APP_COMMANDS.keys(), key=len, reverse=True):
+                if app_name in target_raw.split():
+                    matched_app = app_name
+                    break
+
+        if matched_app:
+            res = close_application(matched_app)
+            return True, {"reply": res, "tool_executed": f"Fast-Path Local: {res}"}
+
+    # Type text
     if prompt.startswith("type ") or prompt.startswith("write "):
         text_to_type = prompt.split(" ", 1)[1]
         pyautogui.write(text_to_type, interval=0.01)
@@ -101,6 +492,7 @@ def fast_path_local_router(user_prompt: str):
 
 JARVIS_SYSTEM_INSTRUCTION = """
 You are KALKI, an autonomous multi-lingual J.A.R.V.I.S.-style AI core assistant.
+Available local commands: open/close apps, volume control, brightness, lock screen, sleep, shutdown (with confirmation), restart (with confirmation), take screenshot.
 Rules:
 1. Reply in English unless the user explicitly asks for another language (for example 'reply in Kannada') or the language setting is set to another language.
 2. Keep responses brief, sharp, concise, and authoritative.
@@ -175,11 +567,16 @@ def get_language_instruction(lang: str) -> str:
         return "Reply only in Kannada (Kannada script)."
     return "Reply in English."
 
-def build_system_instruction(user_prompt: str) -> str:
+VOICE_REPLY_INSTRUCTION = "For voice replies, answer in at most 2 short sentences unless the user asks for detail."
+
+def build_system_instruction(user_prompt: str, is_voice: bool = False) -> str:
     """Builds dynamic system prompt embedding detected reply language instruction."""
     lang = detect_reply_language(user_prompt)
     lang_instruction = get_language_instruction(lang)
-    return f"{JARVIS_SYSTEM_INSTRUCTION.strip()}\n\nExplicit Language Instruction:\n{lang_instruction}"
+    instruction = f"{JARVIS_SYSTEM_INSTRUCTION.strip()}\n\nExplicit Language Instruction:\n{lang_instruction}"
+    if is_voice:
+        instruction += f"\n\nVoice Reply Instruction:\n{VOICE_REPLY_INSTRUCTION}"
+    return instruction
 
 def _call_gemini(user_prompt: str, chat_history: list = None, custom_instruction: Optional[str] = None) -> str:
     """Executes call to Google GenAI Gemini model with a 10s deadline."""
@@ -332,7 +729,7 @@ def _format_error_log(provider: str, err: Exception) -> str:
     status_str = f" status={status}" if status is not None else ""
     return f"[LLM] {provider} failed: {type(err).__name__}{status_str}"
 
-def process_jarvis_intent(user_prompt: str, chat_history: list = None) -> dict:
+def process_jarvis_intent(user_prompt: str, chat_history: list = None, is_voice: bool = False) -> dict:
     """
     Core intent routing chain:
     1. Local regex router (0ms local execution)
@@ -379,7 +776,7 @@ def process_jarvis_intent(user_prompt: str, chat_history: list = None) -> dict:
         return None, None
 
     # Initial call with dynamic system instruction
-    init_inst = build_system_instruction(user_prompt)
+    init_inst = build_system_instruction(user_prompt, is_voice=is_voice)
     reply, tool_name = _execute_cloud_call(user_prompt, init_inst)
 
     if reply is None:
@@ -392,6 +789,8 @@ def process_jarvis_intent(user_prompt: str, chat_history: list = None) -> dict:
     if not is_valid_script_reply(reply, expected_lang):
         script_name = "Kannada script" if expected_lang == "kannada" else ("Devanagari" if expected_lang == "hindi" else "Latin")
         retry_inst = f"{JARVIS_SYSTEM_INSTRUCTION.strip()}\n\nExplicit Language Instruction:\nReply only in {expected_lang.title()}. Use only {script_name} characters."
+        if is_voice:
+            retry_inst += f"\n\nVoice Reply Instruction:\n{VOICE_REPLY_INSTRUCTION}"
         reply_retry, tool_retry = _execute_cloud_call(user_prompt, retry_inst)
 
         if reply_retry and is_valid_script_reply(reply_retry, expected_lang):
@@ -399,6 +798,8 @@ def process_jarvis_intent(user_prompt: str, chat_history: list = None) -> dict:
 
         # If still wrong, reply in English and add a short English note that the requested language could not be used
         eng_inst = f"{JARVIS_SYSTEM_INSTRUCTION.strip()}\n\nExplicit Language Instruction:\nReply in English."
+        if is_voice:
+            eng_inst += f"\n\nVoice Reply Instruction:\n{VOICE_REPLY_INSTRUCTION}"
         eng_reply, eng_tool = _execute_cloud_call(user_prompt, eng_inst)
         if not eng_reply:
             eng_reply = "I could not complete your request at this time."
@@ -407,7 +808,9 @@ def process_jarvis_intent(user_prompt: str, chat_history: list = None) -> dict:
 
     return {"reply": reply, "tool_executed": tool_name}
 
-async def process_jarvis_intent_async(user_prompt: str, chat_history: list = None) -> dict:
+async def process_jarvis_intent_async(user_prompt: str, chat_history: list = None, is_voice: bool = False) -> dict:
+    """Non-blocking async wrapper that offloads blocking SDK calls to a worker thread."""
+    return await asyncio.to_thread(process_jarvis_intent, user_prompt, chat_history, is_voice)
     """Non-blocking async wrapper that offloads blocking SDK calls to a worker thread."""
     return await asyncio.to_thread(process_jarvis_intent, user_prompt, chat_history)
 
@@ -472,7 +875,8 @@ async def process_jarvis_intent_stream(
     user_prompt: str,
     chat_history: list = None,
     cancel_event: Optional[asyncio.Event] = None,
-    request_start_time: Optional[float] = None
+    request_start_time: Optional[float] = None,
+    is_voice: bool = False
 ):
     """
     Yields text chunks with streaming intent routing and language guard:
@@ -493,7 +897,7 @@ async def process_jarvis_intent_stream(
         return
 
     expected_lang = detect_reply_language(user_prompt)
-    init_inst = build_system_instruction(user_prompt)
+    init_inst = build_system_instruction(user_prompt, is_voice=is_voice)
 
     # Validate first sentence script before emitting wrong-script speech
     buffered_chunks = []
@@ -527,6 +931,8 @@ async def process_jarvis_intent_stream(
     if stream_wrong and (not cancel_event or not cancel_event.is_set()):
         script_name = "Kannada script" if expected_lang == "kannada" else ("Devanagari" if expected_lang == "hindi" else "Latin")
         retry_inst = f"{JARVIS_SYSTEM_INSTRUCTION.strip()}\n\nExplicit Language Instruction:\nReply only in {expected_lang.title()}. Use only {script_name} characters."
+        if is_voice:
+            retry_inst += f"\n\nVoice Reply Instruction:\n{VOICE_REPLY_INSTRUCTION}"
 
         retry_chunks = []
         retry_text = ""
@@ -559,6 +965,8 @@ async def process_jarvis_intent_stream(
         if retry_wrong and (not cancel_event or not cancel_event.is_set()):
             yield f"Note: Could not respond in {expected_lang.title()} as requested. "
             eng_inst = f"{JARVIS_SYSTEM_INSTRUCTION.strip()}\n\nExplicit Language Instruction:\nReply in English."
+            if is_voice:
+                eng_inst += f"\n\nVoice Reply Instruction:\n{VOICE_REPLY_INSTRUCTION}"
             async for chunk in _stream_from_providers(user_prompt, eng_inst, chat_history, cancel_event, request_start_time):
                 if cancel_event and cancel_event.is_set():
                     return

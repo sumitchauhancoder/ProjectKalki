@@ -40,7 +40,8 @@ from llm_engine import (
 import tts_engine
 from tts_engine import speak_text
 from sentence_splitter import SentenceSplitter
-from auth import auth_router
+from auth import auth_router, get_current_user
+from admin import admin_router
 from settings import load_settings, save_settings
 
 app = FastAPI(title="KALKI Core Engine", version="1.0.0")
@@ -60,10 +61,31 @@ app.add_middleware(
 )
 
 app.include_router(auth_router)
+app.include_router(admin_router)
 
 # Safe database initialization: do not crash on startup if DB is offline
 try:
     Base.metadata.create_all(bind=engine)
+    # Lightweight schema migration for existing databases
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            is_postgres = "postgres" in str(engine.url)
+            for col, col_def in [
+                ("role", "VARCHAR DEFAULT 'user'"),
+                ("status", "VARCHAR DEFAULT 'active'"),
+                ("last_login", "TIMESTAMP" if is_postgres else "DATETIME")
+            ]:
+                try:
+                    if is_postgres:
+                        conn.execute(text(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {col_def}"))
+                    else:
+                        conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {col_def}"))
+                    conn.commit()
+                except Exception:
+                    pass
+    except Exception:
+        pass
 except Exception as e:
     print(f"[Database Warning] Table initialization skipped: {type(e).__name__}")
 
@@ -326,11 +348,10 @@ async def chat_stream(payload: CommandPayload, db: Optional[Session] = Depends(g
             execute_macro_action(matched_macro)
             macro_reply = f"Executing stored macro '{matched_macro.trigger_phrase}'"
             accumulated_sentences.append(macro_reply)
-            await speak_text(macro_reply, request_start_time=t_start)
             yield f"event: token\ndata: {json.dumps({'text': macro_reply})}\n\n"
         else:
             async for chunk in process_jarvis_intent_stream(
-                cmd, chat_history=history_context, cancel_event=current_cancel, request_start_time=t_start
+                cmd, chat_history=history_context, cancel_event=current_cancel, request_start_time=t_start, is_voice=False
             ):
                 if current_cancel.is_set():
                     break
@@ -339,7 +360,6 @@ async def chat_stream(payload: CommandPayload, db: Optional[Session] = Depends(g
                     if current_cancel.is_set():
                         break
                     accumulated_sentences.append(sentence)
-                    await speak_text(sentence, request_start_time=t_start)
                     yield f"event: token\ndata: {json.dumps({'text': sentence})}\n\n"
 
             if not current_cancel.is_set():
@@ -347,10 +367,11 @@ async def chat_stream(payload: CommandPayload, db: Optional[Session] = Depends(g
                     if current_cancel.is_set():
                         break
                     accumulated_sentences.append(remaining)
-                    await speak_text(remaining, request_start_time=t_start)
                     yield f"event: token\ndata: {json.dumps({'text': remaining})}\n\n"
 
-        full_reply = " ".join(accumulated_sentences)
+        full_reply = " ".join(accumulated_sentences).strip()
+        if full_reply and not current_cancel.is_set():
+            asyncio.create_task(speak_text(full_reply, request_start_time=t_start))
 
         if db is not None and full_reply and not current_cancel.is_set():
             try:
@@ -457,7 +478,7 @@ async def listen_voice(request: Request, db: Optional[Session] = Depends(get_db)
                 executed_info = execute_macro_action(matched_macro)
                 reply_message = f"Executing macro '{matched_macro.trigger_phrase}'"
             else:
-                llm_res = await asyncio.to_thread(process_jarvis_intent, transcript)
+                llm_res = await asyncio.to_thread(process_jarvis_intent, transcript, None, True)
                 reply_message = llm_res.get("reply", "Speech processed.")
                 executed_info = llm_res.get("tool_executed")
 
@@ -498,11 +519,10 @@ async def listen_voice(request: Request, db: Optional[Session] = Depends(get_db)
                 execute_macro_action(matched_macro)
                 macro_reply = f"Executing macro '{matched_macro.trigger_phrase}'"
                 accumulated_sentences.append(macro_reply)
-                await speak_text(macro_reply, request_start_time=t_start)
                 yield f"event: token\ndata: {json.dumps({'text': macro_reply})}\n\n"
             else:
                 async for chunk in process_jarvis_intent_stream(
-                    transcript, cancel_event=current_cancel, request_start_time=t_start
+                    transcript, cancel_event=current_cancel, request_start_time=t_start, is_voice=True
                 ):
                     if current_cancel.is_set():
                         break
@@ -511,7 +531,6 @@ async def listen_voice(request: Request, db: Optional[Session] = Depends(get_db)
                         if current_cancel.is_set():
                             break
                         accumulated_sentences.append(sentence)
-                        await speak_text(sentence, request_start_time=t_start)
                         yield f"event: token\ndata: {json.dumps({'text': sentence})}\n\n"
 
                 if not current_cancel.is_set():
@@ -519,10 +538,12 @@ async def listen_voice(request: Request, db: Optional[Session] = Depends(get_db)
                         if current_cancel.is_set():
                             break
                         accumulated_sentences.append(remaining)
-                        await speak_text(remaining, request_start_time=t_start)
                         yield f"event: token\ndata: {json.dumps({'text': remaining})}\n\n"
 
-            full_reply = " ".join(accumulated_sentences)
+            full_reply = " ".join(accumulated_sentences).strip()
+            if full_reply and not current_cancel.is_set():
+                asyncio.create_task(speak_text(full_reply, request_start_time=t_start))
+
             if db is not None and full_reply and not current_cancel.is_set():
                 try:
                     log_entry = models.AuditLog(
@@ -634,6 +655,23 @@ def get_chat_history(db: Optional[Session] = Depends(get_db)):
     except Exception as e:
         print(f"[Database Error]: {type(e).__name__}")
         raise HTTPException(status_code=503, detail="Database is currently unavailable.")
+
+@app.post("/chat-memory/clear")
+def clear_chat_memory(
+    current_user: models.User = Depends(get_current_user),
+    db: Optional[Session] = Depends(get_db)
+):
+    """Deletes the current user's chat messages. Requires a valid token. Returns count of deleted messages."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database is currently unavailable.")
+    try:
+        deleted_count = db.query(models.ChatMessage).filter(models.ChatMessage.session_id == 1).delete()
+        db.commit()
+        return {"status": "success", "deleted_count": deleted_count}
+    except Exception as e:
+        db.rollback()
+        print(f"[Database Error]: Clear chat memory failed: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="Failed to clear chat memory.")
 
 @app.post("/process-frame")
 async def process_frame(payload: FramePayload):

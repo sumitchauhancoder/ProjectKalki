@@ -127,14 +127,12 @@ playback_hook: Optional[Callable] = None
 
 # Internal queue and worker task references
 _speech_queue: Optional[asyncio.Queue] = None
-_ready_playback_queue: Optional[asyncio.Queue] = None
-_synthesis_task: Optional[asyncio.Task] = None
-_playback_task: Optional[asyncio.Task] = None
 _worker_task: Optional[asyncio.Task] = None
 _worker_loop: Optional[asyncio.AbstractEventLoop] = None
 
 _audio_player_initialized = False
 _cancel_flag = False
+_active_output_file: Optional[Path] = None
 
 def init_audio_player():
     """Initializes persistent pygame.mixer audio player."""
@@ -149,8 +147,8 @@ def init_audio_player():
             print(f"[TTS Audio Warning]: pygame.mixer init failed: {e}")
 
 def cancel_playback_and_queue():
-    """Immediately stops active audio playback and purges all queued and prefetched speech items."""
-    global _cancel_flag, _speech_queue, _ready_playback_queue
+    """Immediately stops active audio playback and purges all queued speech items."""
+    global _cancel_flag, _speech_queue, _active_output_file
     _cancel_flag = True
     try:
         import pygame
@@ -161,31 +159,14 @@ def cancel_playback_and_queue():
     except Exception:
         pass
 
-    # 1. Drain ready playback queue and delete any unplayed prefetched audio files
-    if _ready_playback_queue is not None:
-        while not _ready_playback_queue.empty():
-            try:
-                item = _ready_playback_queue.get_nowait()
-                if isinstance(item, dict):
-                    f = item.get("file")
-                    if f is not None:
-                        try:
-                            if isinstance(f, Path) and f.exists():
-                                f.unlink()
-                            elif isinstance(f, str) and os.path.exists(f):
-                                os.unlink(f)
-                        except Exception:
-                            pass
-                _ready_playback_queue.task_done()
-                if _speech_queue is not None:
-                    try:
-                        _speech_queue.task_done()
-                    except ValueError:
-                        pass
-            except (asyncio.QueueEmpty, ValueError):
-                break
+    if _active_output_file is not None:
+        try:
+            if _active_output_file.exists():
+                _active_output_file.unlink()
+        except Exception:
+            pass
+        _active_output_file = None
 
-    # 2. Drain pending text speech queue
     if _speech_queue is not None:
         while not _speech_queue.empty():
             try:
@@ -233,9 +214,9 @@ async def _play_file_persistent(output_path_str: str):
         except Exception:
             pass
 
-async def _synthesis_worker():
-    """Worker task that synthesizes speech for incoming text jobs into a bounded ready queue."""
-    global playback_hook, _debug_counter
+async def _tts_worker():
+    """Sequential worker task that processes speech jobs from the queue one at a time."""
+    global playback_hook, _debug_counter, _active_output_file
     while True:
         try:
             job = await _speech_queue.get()
@@ -263,15 +244,12 @@ async def _synthesis_worker():
                 dominant_script = get_dominant_script(cleaned_text)
                 print(f"[DEBUG_AUDIO] Voice: {voice} | Script: {dominant_script}", flush=True)
 
-            # If a test or mock playback hook is registered, skip actual edge-tts synthesis
+            # If a test or mock playback hook is registered, use it
             if playback_hook is not None:
-                await _ready_playback_queue.put({
-                    "mock": True,
-                    "text": cleaned_text,
-                    "file": None,
-                    "path_str": None,
-                    "req_start": req_start
-                })
+                res = playback_hook(cleaned_text)
+                if asyncio.iscoroutine(res):
+                    await res
+                _speech_queue.task_done()
                 continue
 
             if _cancel_flag:
@@ -279,6 +257,7 @@ async def _synthesis_worker():
                 continue
 
             output_file = get_unique_tts_path()
+            _active_output_file = output_file
             output_path_str = str(output_file).replace("\\", "/")
 
             t_gen_start = time.perf_counter()
@@ -287,10 +266,12 @@ async def _synthesis_worker():
                 await asyncio.wait_for(communicate.save(output_path_str), timeout=15.0)
             except asyncio.TimeoutError:
                 print("[TTS Warning]: Edge-TTS speech generation timed out.", flush=True)
+                _active_output_file = None
                 _speech_queue.task_done()
                 continue
             except Exception as gen_err:
                 print(f"[TTS Error]: Edge-TTS generation failed: {type(gen_err).__name__}", flush=True)
+                _active_output_file = None
                 _speech_queue.task_done()
                 continue
             t_gen_end = time.perf_counter()
@@ -301,10 +282,10 @@ async def _synthesis_worker():
                         output_file.unlink()
                 except Exception:
                     pass
+                _active_output_file = None
                 _speech_queue.task_done()
                 continue
 
-            # In DEBUG_AUDIO mode, save a numbered copy to debug_audio dir
             if os.getenv("DEBUG_AUDIO", "0") == "1" and output_file.exists():
                 try:
                     debug_dir = get_debug_audio_dir()
@@ -316,75 +297,30 @@ async def _synthesis_worker():
 
             if req_start is not None and os.getenv("DEBUG_TIMING", "0") == "1":
                 gen_ms = (t_gen_end - t_gen_start) * 1000
+                playback_start_ms = (time.perf_counter() - req_start) * 1000
                 print(f"[TIMING] TTS generation time: {gen_ms:.1f}ms", flush=True)
+                print(f"[TIMING] Time until audio playback starts: {playback_start_ms:.1f}ms", flush=True)
 
-            # Put into ready playback queue. Maxsize=2 caps prefetching at 2 sentences ahead.
-            await _ready_playback_queue.put({
-                "mock": False,
-                "text": cleaned_text,
-                "file": output_file,
-                "path_str": output_path_str,
-                "req_start": req_start,
-                "gen_ms": (t_gen_end - t_gen_start) * 1000
-            })
-
-            # Check again if cancelled while waiting to put into queue
-            if _cancel_flag and output_file.exists():
+            try:
+                if output_file.exists() and not _cancel_flag:
+                    await _play_file_persistent(output_path_str)
+            finally:
                 try:
-                    output_file.unlink()
+                    if output_file.exists():
+                        output_file.unlink()
                 except Exception:
                     pass
-
-        except asyncio.CancelledError:
-            break
-        except Exception as loop_err:
-            print(f"[TTS Synthesis Error]: {type(loop_err).__name__}", flush=True)
-
-async def _playback_worker():
-    """Worker task that sequentially plays synthesized audio files from the ready queue."""
-    global playback_hook
-    while True:
-        try:
-            item = await _ready_playback_queue.get()
-            output_file = item.get("file")
-            try:
-                if _cancel_flag:
-                    continue
-
-                if item.get("mock") or playback_hook is not None:
-                    res = playback_hook(item["text"])
-                    if asyncio.iscoroutine(res):
-                        await res
-                else:
-                    path_str = item.get("path_str")
-                    req_start = item.get("req_start")
-                    if req_start is not None and os.getenv("DEBUG_TIMING", "0") == "1":
-                        playback_start_ms = (time.perf_counter() - req_start) * 1000
-                        print(f"[TIMING] Time until audio playback starts: {playback_start_ms:.1f}ms", flush=True)
-
-                    if output_file is not None and output_file.exists() and not _cancel_flag:
-                        await _play_file_persistent(path_str)
-
-            except Exception as play_err:
-                print(f"[TTS Playback Error]: {type(play_err).__name__}", flush=True)
-            finally:
-                if output_file is not None:
-                    try:
-                        if output_file.exists():
-                            output_file.unlink()
-                    except Exception:
-                        pass
-                _ready_playback_queue.task_done()
+                _active_output_file = None
                 _speech_queue.task_done()
 
         except asyncio.CancelledError:
             break
         except Exception as loop_err:
-            print(f"[TTS Playback Loop Error]: {type(loop_err).__name__}", flush=True)
+            print(f"[TTS Worker Error]: {type(loop_err).__name__}", flush=True)
 
 def get_tts_queue() -> asyncio.Queue:
-    """Returns the single asyncio.Queue, initializing the synthesis and playback workers if needed."""
-    global _speech_queue, _ready_playback_queue, _synthesis_task, _playback_task, _worker_task, _worker_loop
+    """Returns the single asyncio.Queue, initializing the worker if needed."""
+    global _speech_queue, _worker_task, _worker_loop
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -392,18 +328,11 @@ def get_tts_queue() -> asyncio.Queue:
 
     if _speech_queue is None or (loop is not None and _worker_loop is not loop):
         _speech_queue = asyncio.Queue()
-        _ready_playback_queue = asyncio.Queue(maxsize=2)
-        _synthesis_task = None
-        _playback_task = None
         _worker_task = None
         _worker_loop = loop
 
-    if loop is not None:
-        if _synthesis_task is None or _synthesis_task.done():
-            _synthesis_task = loop.create_task(_synthesis_worker())
-        if _playback_task is None or _playback_task.done():
-            _playback_task = loop.create_task(_playback_worker())
-        _worker_task = _playback_task
+    if loop is not None and (_worker_task is None or _worker_task.done()):
+        _worker_task = loop.create_task(_tts_worker())
         _worker_loop = loop
 
     return _speech_queue

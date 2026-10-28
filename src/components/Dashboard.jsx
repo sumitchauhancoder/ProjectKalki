@@ -138,7 +138,7 @@ export default function Dashboard({
                 type="text"
                 value={manualCommand}
                 onChange={(e) => setManualCommand(e.target.value)}
-                placeholder="Type command (e.g., 'open calculator')..."
+                placeholder="Try: open notepad, volume up, take screenshot..."
                 className="command-input"
               />
               <button type="submit" className="btn-primary-red">

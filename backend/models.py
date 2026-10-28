@@ -12,6 +12,9 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
     reset_token = Column(String, nullable=True)
+    role = Column(String, default="user", nullable=False)
+    status = Column(String, default="active", nullable=False)
+    last_login = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class VoiceMacro(Base):

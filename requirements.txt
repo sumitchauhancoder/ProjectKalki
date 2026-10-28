@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pyautogui
+opencv-python
+sqlalchemy
+psycopg2-binary
+pydantic
+pycaw
+screen-brightness-control
+mss
