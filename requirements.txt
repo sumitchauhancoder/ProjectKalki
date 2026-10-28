@@ -8,3 +8,4 @@ pydantic
 pycaw
 screen-brightness-control
 mss
+pyperclip

@@ -75,6 +75,72 @@ APP_COMMANDS = {
 
 APP_MAP = APP_COMMANDS
 
+# --------------------------------------------------------------------------
+# Group 2: Keyboard Shortcuts, Key Allowlist & Path Configuration
+# --------------------------------------------------------------------------
+SHORTCUTS_MAP = {
+    # Clipboard & Edit
+    "copy": ("ctrl", "c"),
+    "copy that": ("ctrl", "c"),
+    "press copy": ("ctrl", "c"),
+    "paste": ("ctrl", "v"),
+    "paste that": ("ctrl", "v"),
+    "press paste": ("ctrl", "v"),
+    "cut": ("ctrl", "x"),
+    "press cut": ("ctrl", "x"),
+    "undo": ("ctrl", "z"),
+    "press undo": ("ctrl", "z"),
+    "redo": ("ctrl", "y"),
+    "press redo": ("ctrl", "y"),
+    "select all": ("ctrl", "a"),
+    "select everything": ("ctrl", "a"),
+    "save": ("ctrl", "s"),
+    "save file": ("ctrl", "s"),
+    "save this": ("ctrl", "s"),
+
+    # Tabs & Browser Navigation
+    "new tab": ("ctrl", "t"),
+    "open new tab": ("ctrl", "t"),
+    "close tab": ("ctrl", "w"),
+    "refresh": ("f5",),
+    "reload page": ("f5",),
+    "go back": ("alt", "left"),
+    "browser back": ("alt", "left"),
+    "go forward": ("alt", "right"),
+    "browser forward": ("alt", "right"),
+    "zoom in": ("ctrl", "+"),
+    "zoom out": ("ctrl", "-"),
+
+    # Window Management
+    "fullscreen": ("f11",),
+    "full screen": ("f11",),
+    "minimize": ("win", "down"),
+    "minimise": ("win", "down"),
+    "maximize": ("win", "up"),
+    "maximise": ("win", "up"),
+    "switch window": ("alt", "tab"),
+    "alt tab": ("alt", "tab"),
+    "show desktop": ("win", "d"),
+    "desktop": ("win", "d"),
+
+    # Basic Key Presses
+    "press enter": ("enter",),
+    "hit enter": ("enter",),
+    "enter key": ("enter",),
+    "press escape": ("esc",),
+    "escape": ("esc",),
+    "press esc": ("esc",),
+    "press space": ("space",),
+    "spacebar": ("space",),
+    "press tab": ("tab",),
+}
+
+ALLOWED_PRESS_KEYS = {
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+    "home", "end", "pageup", "pagedown", "insert", "delete", "backspace",
+    "numlock", "capslock", "scrolllock", "printscreen", "pause"
+}
+
 _pending_action: Optional[str] = None
 _pending_action_timestamp: float = 0.0
 
@@ -351,8 +417,291 @@ def take_screenshot() -> str:
 
     return f"Screenshot saved to Pictures/KALKI Screenshots/{filename}"
 
+# --------------------------------------------------------------------------
+# Group 2: Local Utilities (Path Open, File Search, Type, Shortcuts, Clipboard)
+# --------------------------------------------------------------------------
+def handle_open_path(prompt: str) -> Optional[Tuple[bool, Dict[str, str]]]:
+    """Opens a local file or directory using os.startfile."""
+    m = re.match(r'^(?:open\s+(?:file\s+|folder\s+)?)(.+)$', prompt, re.IGNORECASE)
+    if not m:
+        return None
+
+    candidate = m.group(1).strip().strip("\"'")
+    is_path = ("\\" in candidate) or ("/" in candidate) or bool(re.match(r'^[a-zA-Z]:', candidate))
+    if not is_path:
+        return None
+
+    if candidate.startswith(r"\\") or candidate.startswith("//"):
+        return True, {
+            "reply": "Network paths are not supported.",
+            "tool_executed": "Fast-Path Local: reject_network_path"
+        }
+
+    target = Path(candidate)
+    if not target.exists():
+        return True, {
+            "reply": "I couldn't find that file or folder.",
+            "tool_executed": "Fast-Path Local: path_not_found"
+        }
+
+    try:
+        os.startfile(str(target))
+        filename = target.name or str(target)
+        return True, {
+            "reply": f"Opening {filename}.",
+            "tool_executed": f"Fast-Path Local: open_path_{filename}"
+        }
+    except Exception as e:
+        return True, {
+            "reply": f"Failed to open path: {e}",
+            "tool_executed": "Fast-Path Local: open_path_error"
+        }
+
+def search_local_files(query_name: str) -> str:
+    """Searches Desktop, Documents, Downloads, Pictures, Music, Videos for matching files up to 3 levels deep."""
+    user_profile = os.environ.get("USERPROFILE", str(Path.home()))
+    base_dirs = ["Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos"]
+    search_folders = []
+    for d in base_dirs:
+        p = Path(user_profile) / d
+        if p.exists():
+            search_folders.append((d, p))
+
+    query_clean = query_name.lower().strip().strip("\"'")
+    matches = []
+    stop_event = threading.Event()
+
+    def do_search():
+        for top_name, top_folder in search_folders:
+            if stop_event.is_set():
+                break
+            try:
+                base_depth = len(top_folder.parts)
+                for root, dirs, files in os.walk(str(top_folder)):
+                    if stop_event.is_set():
+                        break
+                    cur_depth = len(Path(root).parts) - base_depth
+                    if cur_depth >= 3:
+                        dirs[:] = []
+                        continue
+                    for f in files:
+                        if stop_event.is_set():
+                            break
+                        if query_clean == f.lower() or query_clean in f.lower():
+                            matches.append((f, top_name))
+                            if len(matches) >= 5:
+                                return
+            except Exception:
+                continue
+
+    th = threading.Thread(target=do_search, daemon=True)
+    th.start()
+    th.join(timeout=5.0)
+
+    if th.is_alive():
+        stop_event.set()
+        return "Search is taking too long. Try being more specific."
+
+    if not matches:
+        return f"I couldn't find any file named {query_name} in your common folders."
+
+    first_file, first_folder = matches[0]
+    result_text = f"I found {first_file} in {first_folder}."
+    if len(matches) > 1:
+        other_folders = list(dict.fromkeys([m[1] for m in matches[1:]]))
+        if len(other_folders) == 1:
+            result_text += f" Also in {other_folders[0]}."
+        else:
+            result_text += f" Also in {', '.join(other_folders)}."
+
+    return result_text
+
+def handle_file_search(prompt: str) -> Optional[Tuple[bool, Dict[str, str]]]:
+    """Parses file search requests."""
+    query = None
+    if prompt.startswith("find file "):
+        query = prompt[10:].strip()
+    elif prompt.startswith("search for file "):
+        query = prompt[16:].strip()
+    elif prompt.startswith("search file "):
+        query = prompt[12:].strip()
+    elif prompt.startswith("where is "):
+        query = prompt[9:].strip()
+    elif prompt.startswith("find "):
+        candidate = prompt[5:].strip()
+        if candidate and candidate not in ["out", "it", "more"]:
+            query = candidate
+
+    if not query:
+        return None
+
+    res = search_local_files(query)
+    return True, {
+        "reply": res,
+        "tool_executed": f"Fast-Path Local: search_files_{query[:20]}"
+    }
+
+def handle_type_text(prompt: str) -> Optional[Tuple[bool, Dict[str, str]]]:
+    """Simulates keyboard text input with delay and validation."""
+    extracted_text = None
+    for prefix in ["type this ", "type ", "write ", "enter "]:
+        if prompt.lower().startswith(prefix):
+            extracted_text = prompt[len(prefix):]
+            break
+    if prompt.lower().strip() in ["type", "write", "enter", "type this"]:
+        extracted_text = ""
+
+    if extracted_text is None:
+        return None
+
+    extracted_text = extracted_text.strip()
+    if not extracted_text:
+        return True, {
+            "reply": "Please specify text to type.",
+            "tool_executed": "Fast-Path Local: type_text_empty"
+        }
+
+    if len(extracted_text) > 500:
+        return True, {
+            "reply": "Text is too long to type. Maximum is 500 characters.",
+            "tool_executed": "Fast-Path Local: type_text_too_long"
+        }
+
+    env_secrets = [
+        os.getenv("GEMINI_API_KEY"),
+        os.getenv("GROQ_API_KEY"),
+        os.getenv("DATABASE_URL"),
+        os.getenv("JWT_SECRET"),
+    ]
+    for sec in env_secrets:
+        if sec and len(sec.strip()) > 5 and sec.strip() in extracted_text:
+            return True, {
+                "reply": "Refused to type sensitive security credential.",
+                "tool_executed": "Fast-Path Local: type_text_security_refusal"
+            }
+
+    time.sleep(0.5)
+
+    try:
+        if extracted_text.isascii():
+            pyautogui.typewrite(extracted_text, interval=0.01)
+        else:
+            pyautogui.write(extracted_text, interval=0.01)
+    except Exception as e:
+        return True, {
+            "reply": f"Failed to type text: {e}",
+            "tool_executed": "Fast-Path Local: type_text_error"
+        }
+
+    preview = extracted_text[:30]
+    return True, {
+        "reply": f"Typing: {preview}...",
+        "tool_executed": "Fast-Path Local: type_text"
+    }
+
+def handle_keyboard_shortcut(prompt: str) -> Optional[Tuple[bool, Dict[str, str]]]:
+    """Executes predefined system keyboard shortcuts."""
+    if prompt not in SHORTCUTS_MAP:
+        return None
+
+    keys = SHORTCUTS_MAP[prompt]
+    try:
+        if len(keys) == 1:
+            pyautogui.press(keys[0])
+        else:
+            pyautogui.hotkey(*keys)
+        return True, {
+            "reply": "Done.",
+            "tool_executed": f"Fast-Path Local: shortcut_{'_'.join(keys)}"
+        }
+    except Exception as e:
+        return True, {
+            "reply": f"Failed to execute shortcut: {e}",
+            "tool_executed": "Fast-Path Local: shortcut_error"
+        }
+
+def handle_press_key(prompt: str) -> Optional[Tuple[bool, Dict[str, str]]]:
+    """Presses a single key from the allowed keys list."""
+    if not prompt.startswith("press "):
+        return None
+
+    key_name = prompt[6:].strip().lower()
+    if key_name in ALLOWED_PRESS_KEYS:
+        try:
+            pyautogui.press(key_name)
+            return True, {
+                "reply": f"Pressed {key_name}.",
+                "tool_executed": f"Fast-Path Local: press_{key_name}"
+            }
+        except Exception as e:
+            return True, {
+                "reply": f"Failed to press key: {e}",
+                "tool_executed": "Fast-Path Local: press_key_error"
+            }
+
+    if prompt in SHORTCUTS_MAP:
+        return None
+
+    # Disallowed keys route to LLM
+    return None
+
+def handle_scroll(prompt: str) -> Optional[Tuple[bool, Dict[str, str]]]:
+    """Performs page or window scrolling."""
+    scroll_map = {
+        "scroll up": 5,
+        "scroll page up": 5,
+        "scroll down": -5,
+        "scroll page down": -5,
+        "scroll up fast": 15,
+        "scroll down fast": -15,
+    }
+    if prompt in scroll_map:
+        val = scroll_map[prompt]
+        try:
+            pyautogui.scroll(val)
+            return True, {
+                "reply": "Scrolled.",
+                "tool_executed": f"Fast-Path Local: scroll_{val}"
+            }
+        except Exception as e:
+            return True, {
+                "reply": f"Failed to scroll: {e}",
+                "tool_executed": "Fast-Path Local: scroll_error"
+            }
+    return None
+
+def handle_clipboard(prompt: str) -> Optional[Tuple[bool, Dict[str, str]]]:
+    """Reads system clipboard text safely without logging contents."""
+    if prompt in ["what did i copy", "read clipboard", "what's in clipboard", "whats in clipboard", "paste content"]:
+        try:
+            import pyperclip
+            content = pyperclip.paste()
+            if not content or not content.strip():
+                return True, {
+                    "reply": "Clipboard is empty.",
+                    "tool_executed": "Fast-Path Local: clipboard_empty"
+                }
+
+            clean_content = content.strip()
+            if len(clean_content) > 200:
+                truncated = clean_content[:200] + "... (truncated)"
+                reply_text = f"Clipboard contains: {truncated}"
+            else:
+                reply_text = f"Clipboard contains: {clean_content}"
+
+            return True, {
+                "reply": reply_text,
+                "tool_executed": "Fast-Path Local: read_clipboard"
+            }
+        except Exception as e:
+            return True, {
+                "reply": f"Failed to read clipboard: {e}",
+                "tool_executed": "Fast-Path Local: clipboard_error"
+            }
+    return None
+
 def fast_path_local_router(user_prompt: str):
-    """0ms Instant local execution for Group 1 app and system control commands."""
+    """0ms Instant local execution for Group 1 and Group 2 system control commands."""
     global _pending_action, _pending_action_timestamp
     prompt = user_prompt.lower().strip()
     now = time.time()
@@ -444,7 +793,16 @@ def fast_path_local_router(user_prompt: str):
         res = take_screenshot()
         return True, {"reply": res, "tool_executed": f"Fast-Path Local: {res}"}
 
-    # App Open / Launch
+    # --------------------------------------------------------------------------
+    # Group 1 & Group 2 Execution Handlers
+    # --------------------------------------------------------------------------
+
+    # Open File / Folder by path
+    path_res = handle_open_path(user_prompt)
+    if path_res is not None:
+        return path_res
+
+    # App Open / Launch (Allowlist from APP_COMMANDS)
     open_match = re.search(r'^(?:please\s+)?(?:open|launch|start|run)\s+(?:up\s+)?(?:the\s+)?([a-z0-9\s\.\-_]+)$', prompt)
     if open_match:
         target_raw = open_match.group(1).strip()
@@ -463,7 +821,7 @@ def fast_path_local_router(user_prompt: str):
             res = launch_application(matched_app)
             return True, {"reply": res, "tool_executed": f"Fast-Path Local: {res}"}
 
-    # App Close / Exit
+    # App Close / Exit (Allowlist from APP_COMMANDS)
     close_match = re.search(r'^(?:please\s+)?(?:close|exit|quit|kill|terminate)\s+(?:the\s+)?([a-z0-9\s\.\-_]+)$', prompt)
     if close_match:
         target_raw = close_match.group(1).strip()
@@ -482,17 +840,41 @@ def fast_path_local_router(user_prompt: str):
             res = close_application(matched_app)
             return True, {"reply": res, "tool_executed": f"Fast-Path Local: {res}"}
 
-    # Type text
-    if prompt.startswith("type ") or prompt.startswith("write "):
-        text_to_type = prompt.split(" ", 1)[1]
-        pyautogui.write(text_to_type, interval=0.01)
-        return True, {"reply": f"Typed: '{text_to_type}'", "tool_executed": "Fast-Path Local: type_text"}
+    # Keyboard Shortcuts (Ctrl+C, Ctrl+V, Alt+Tab, etc.)
+    shortcut_res = handle_keyboard_shortcut(prompt)
+    if shortcut_res is not None:
+        return shortcut_res
+
+    # Press Key by Name (f1-f12, home, end, etc.)
+    press_res = handle_press_key(prompt)
+    if press_res is not None:
+        return press_res
+
+    # Search for a file
+    search_res = handle_file_search(prompt)
+    if search_res is not None:
+        return search_res
+
+    # Scroll Page Up / Down
+    scroll_res = handle_scroll(prompt)
+    if scroll_res is not None:
+        return scroll_res
+
+    # Read Clipboard Content
+    clip_res = handle_clipboard(prompt)
+    if clip_res is not None:
+        return clip_res
+
+    # Type Text Anywhere
+    type_res = handle_type_text(user_prompt)
+    if type_res is not None:
+        return type_res
 
     return False, None
 
 JARVIS_SYSTEM_INSTRUCTION = """
 You are KALKI, an autonomous multi-lingual J.A.R.V.I.S.-style AI core assistant.
-Available local commands: open/close apps, volume control, brightness, lock screen, sleep, shutdown (with confirmation), restart (with confirmation), take screenshot.
+Available local commands: open/close apps, volume control, brightness, lock screen, sleep, shutdown (with confirmation), restart (with confirmation), take screenshot, type text, keyboard shortcuts (copy, paste, undo, save etc), open files, find files, scroll, read clipboard.
 Rules:
 1. Reply in English unless the user explicitly asks for another language (for example 'reply in Kannada') or the language setting is set to another language.
 2. Keep responses brief, sharp, concise, and authoritative.

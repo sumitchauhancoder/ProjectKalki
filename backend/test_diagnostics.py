@@ -941,11 +941,120 @@ def run_all_checks():
         all_passed = False
 
     # --------------------------------------------------------------------------
+    # Check 17: Group 2 Local Commands (Type, Shortcuts, Paths, Keys, Scroll, Clipboard)
+    # --------------------------------------------------------------------------
+    print("\n[Check 17] Group 2 Local Commands:")
+    try:
+        from unittest.mock import MagicMock
+        import pyautogui
+        import pyperclip
+
+        # 17a. "type hello world" extracts "hello world" and calls pyautogui with it
+        with patch.object(pyautogui, "typewrite") as mock_typewrite, \
+             patch.object(pyautogui, "write") as mock_write, \
+             patch("time.sleep") as mock_sleep, \
+             patch.object(llm_engine, "_call_groq") as mock_groq:
+            res_type = llm_engine.process_jarvis_intent("type hello world")
+            assert not mock_groq.called, "Cloud LLM called for type hello world!"
+            assert mock_typewrite.called or mock_write.called, "pyautogui was not called to type text!"
+            call_text = mock_typewrite.call_args[0][0] if mock_typewrite.called else mock_write.call_args[0][0]
+            assert call_text == "hello world", f"Unexpected typed text: {call_text}"
+            assert "Typing: hello world" in res_type.get("reply", "")
+        print("  17a. 'type hello world' extracts 'hello world' and calls pyautogui.")
+
+        # 17b. "type" with no text returns the empty text error
+        with patch.object(llm_engine, "_call_groq") as mock_groq:
+            res_empty_type = llm_engine.process_jarvis_intent("type")
+            assert not mock_groq.called, "Cloud LLM called for empty type!"
+            assert "Please specify text to type." in res_empty_type.get("reply", "")
+        print("  17b. 'type' with empty text returns empty text error.")
+
+        # 17c. Text over 500 characters returns the length error
+        long_text = "a" * 501
+        with patch.object(llm_engine, "_call_groq") as mock_groq:
+            res_long = llm_engine.process_jarvis_intent(f"type {long_text}")
+            assert not mock_groq.called, "Cloud LLM called for long type!"
+            assert "Text is too long to type. Maximum is 500 characters." in res_long.get("reply", "")
+        print("  17c. Text over 500 characters returns maximum length error.")
+
+        # 17d. "copy" calls pyautogui.hotkey with Ctrl+C
+        with patch.object(pyautogui, "hotkey") as mock_hotkey, \
+             patch.object(llm_engine, "_call_groq") as mock_groq:
+            res_copy = llm_engine.process_jarvis_intent("copy")
+            assert not mock_groq.called, "Cloud LLM called for copy shortcut!"
+            assert mock_hotkey.called, "pyautogui.hotkey was not called for copy!"
+            hotkey_args = tuple(arg.lower() for arg in mock_hotkey.call_args[0])
+            assert hotkey_args == ("ctrl", "c"), f"Unexpected hotkey args: {hotkey_args}"
+            assert "Done." in res_copy.get("reply", "")
+        print("  17d. 'copy' calls pyautogui.hotkey with ('ctrl', 'c').")
+
+        # 17e. "press f5" matches the allowlist and calls pyautogui.press
+        with patch.object(pyautogui, "press") as mock_press, \
+             patch.object(llm_engine, "_call_groq") as mock_groq:
+            res_f5 = llm_engine.process_jarvis_intent("press f5")
+            assert not mock_groq.called, "Cloud LLM called for press f5!"
+            assert mock_press.called, "pyautogui.press was not called for press f5!"
+            assert mock_press.call_args[0][0] == "f5", f"Unexpected press key: {mock_press.call_args}"
+            assert "Pressed f5." in res_f5.get("reply", "")
+        print("  17e. 'press f5' matches allowlist and calls pyautogui.press.")
+
+        # 17f. "press malicious_key" is rejected and routes to LLM
+        with patch.object(llm_engine, "_call_groq", return_value="Refused unallowed key press.") as mock_groq:
+            res_mal_key = llm_engine.process_jarvis_intent("press malicious_key")
+            assert mock_groq.called, "Cloud LLM was NOT called for unauthorized key press!"
+            assert "Refused unallowed key press." in res_mal_key.get("reply", "")
+        print("  17f. 'press malicious_key' is rejected by allowlist and routes to LLM.")
+
+        # 17g. "open C:\Users\test\file.txt" calls os.startfile
+        with patch("pathlib.Path.exists", return_value=True), \
+             patch("os.startfile") as mock_startfile, \
+             patch.object(llm_engine, "_call_groq") as mock_groq:
+            res_open_file = llm_engine.process_jarvis_intent(r"open C:\Users\test\file.txt")
+            assert not mock_groq.called, "Cloud LLM called for local path open!"
+            assert mock_startfile.called, "os.startfile was not called for local file path!"
+            assert mock_startfile.call_args[0][0] == r"C:\Users\test\file.txt", f"Unexpected startfile path: {mock_startfile.call_args}"
+            assert "Opening file.txt." in res_open_file.get("reply", "")
+        print(r"  17g. 'open C:\Users\test\file.txt' calls os.startfile.")
+
+        # 17h. "open \\network\share" is rejected
+        with patch.object(llm_engine, "_call_groq") as mock_groq:
+            res_net = llm_engine.process_jarvis_intent(r"open \\network\share")
+            assert not mock_groq.called, "Cloud LLM called for network path reject!"
+            assert "Network paths are not supported." in res_net.get("reply", "")
+        print(r"  17h. 'open \\network\share' is rejected with 'Network paths are not supported.'")
+
+        # 17i. "scroll down" calls pyautogui.scroll with a negative value
+        with patch.object(pyautogui, "scroll") as mock_scroll, \
+             patch.object(llm_engine, "_call_groq") as mock_groq:
+            res_scroll = llm_engine.process_jarvis_intent("scroll down")
+            assert not mock_groq.called, "Cloud LLM called for scroll down!"
+            assert mock_scroll.called, "pyautogui.scroll was not called!"
+            scroll_val = mock_scroll.call_args[0][0]
+            assert scroll_val < 0, f"Expected negative scroll value for scroll down, got {scroll_val}"
+            assert "Scrolled." in res_scroll.get("reply", "")
+        print("  17i. 'scroll down' calls pyautogui.scroll with negative value.")
+
+        # 17j. "read clipboard" calls pyperclip.paste and returns the content
+        with patch.object(pyperclip, "paste", return_value="Sample clipboard data 12345") as mock_paste, \
+             patch.object(llm_engine, "_call_groq") as mock_groq:
+            res_clip = llm_engine.process_jarvis_intent("read clipboard")
+            assert not mock_groq.called, "Cloud LLM called for read clipboard!"
+            assert mock_paste.called, "pyperclip.paste was not called!"
+            assert "Clipboard contains: Sample clipboard data 12345" in res_clip.get("reply", "")
+        print("  17j. 'read clipboard' calls pyperclip.paste and returns safe preview.")
+        print("  PASS")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"  FAIL — {e}")
+        all_passed = False
+
+    # --------------------------------------------------------------------------
     # Summary
     # --------------------------------------------------------------------------
     print("\n" + "=" * 70)
     if all_passed:
-        print("ALL 16 DIAGNOSTICS & SAFETY CHECKS PASSED [PASS]")
+        print("ALL 17 DIAGNOSTICS & SAFETY CHECKS PASSED [PASS]")
         print("=" * 70)
         sys.exit(0)
     else:
