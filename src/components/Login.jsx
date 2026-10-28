@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { API_BASE_URL } from "../config";
 import "./Login.css";
 
 export default function Login({ onLoginSuccess }) {
@@ -12,22 +13,35 @@ export default function Login({ onLoginSuccess }) {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
+  const formatNetworkError = (err) => {
+    // Only show unreachable message for actual network/fetch errors, not HTTP status errors
+    if (
+      err instanceof TypeError ||
+      (err.message && err.message.toLowerCase().includes("failed to fetch"))
+    ) {
+      return `Cannot reach KALKI backend at ${API_BASE_URL}. Is it running?`;
+    }
+    return err.message || "An unexpected error occurred.";
+  };
+
   const handleLoginSubmit = async (e) => {
     e.preventDefault();
     setError("");
     setMessage("");
     try {
-      const res = await fetch("http://localhost:8000/api/auth/login", {
+      const res = await fetch(`${API_BASE_URL}/api/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ identifier, password }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Login failed");
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || data.message || "Login failed");
+      }
 
       onLoginSuccess(data.user);
     } catch (err) {
-      setError(err.message);
+      setError(formatNetworkError(err));
     }
   };
 
@@ -36,18 +50,20 @@ export default function Login({ onLoginSuccess }) {
     setError("");
     setMessage("");
     try {
-      const res = await fetch("http://localhost:8000/api/auth/register", {
+      const res = await fetch(`${API_BASE_URL}/api/auth/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name, username, email, password }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Registration failed");
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || data.message || "Registration failed");
+      }
 
       setMessage("Registration successful! Please sign in.");
       setAuthMode("login");
     } catch (err) {
-      setError(err.message);
+      setError(formatNetworkError(err));
     }
   };
 
@@ -56,16 +72,15 @@ export default function Login({ onLoginSuccess }) {
     setError("");
     setMessage("");
     try {
-      const res = await fetch(
-        "http://localhost:8000/api/auth/forgot-password",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email }),
-        },
-      );
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Request failed");
+      const res = await fetch(`${API_BASE_URL}/api/auth/forgot-password`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || data.message || "Request failed");
+      }
 
       setMessage(
         data.dev_reset_token
@@ -73,7 +88,7 @@ export default function Login({ onLoginSuccess }) {
           : data.message,
       );
     } catch (err) {
-      setError(err.message);
+      setError(formatNetworkError(err));
     }
   };
 

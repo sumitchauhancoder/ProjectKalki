@@ -60,16 +60,20 @@ Base = declarative_base()
 
 def get_db():
     """Dependency that yields a session; yields None if connection fails."""
-    db = None
+    if SessionLocal is None:
+        yield None
+        return
     try:
         db = SessionLocal()
-        yield db
     except Exception as e:
         print(f"[Database Error]: Connection attempt failed: {type(e).__name__}")
         yield None
+        return
+
+    try:
+        yield db
     finally:
-        if db is not None:
-            try:
-                db.close()
-            except Exception:
-                pass
+        try:
+            db.close()
+        except Exception:
+            pass

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import { API_BASE_URL } from "./config";
 import Home from "./components/Home";
 import Login from "./components/Login";
 import Dashboard from "./components/Dashboard";
@@ -38,7 +39,7 @@ export default function App() {
 
   const fetchMacros = async () => {
     try {
-      const res = await fetch("http://127.0.0.1:8000/macros");
+      const res = await fetch(`${API_BASE_URL}/macros`);
       const data = await res.json();
       setMacros(data);
     } catch (err) {
@@ -48,7 +49,7 @@ export default function App() {
 
   const fetchAuditLogs = async () => {
     try {
-      const res = await fetch("http://127.0.0.1:8000/audit-logs");
+      const res = await fetch(`${API_BASE_URL}/audit-logs`);
       const data = await res.json();
       setAuditLogs(data);
     } catch (err) {
@@ -58,7 +59,7 @@ export default function App() {
 
   const fetchChatHistory = async () => {
     try {
-      const res = await fetch("http://127.0.0.1:8000/chat-history");
+      const res = await fetch(`${API_BASE_URL}/chat-history`);
       const data = await res.json();
       setChatHistory(data);
     } catch (err) {
@@ -78,7 +79,7 @@ export default function App() {
       payloadObj = { text: newPayloadVal };
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/macros", {
+      const res = await fetch(`${API_BASE_URL}/macros`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -101,7 +102,7 @@ export default function App() {
     setListening(true);
     setStatus("Listening via Python Core Mic (4s)...");
     try {
-      const response = await fetch("http://127.0.0.1:8000/listen-voice", {
+      const response = await fetch(`${API_BASE_URL}/listen-voice`, {
         method: "POST",
       });
       const data = await response.json();
@@ -124,7 +125,7 @@ export default function App() {
   const sendCommandToBackend = async (commandText) => {
     setStatus("KALKI: Thinking...");
     try {
-      const response = await fetch("http://127.0.0.1:8000/execute-command", {
+      const response = await fetch(`${API_BASE_URL}/execute-command`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command: commandText }),
@@ -204,7 +205,7 @@ export default function App() {
 
     try {
       setStatus("Analyzing screen frame with OpenCV...");
-      const response = await fetch("http://127.0.0.1:8000/process-frame", {
+      const response = await fetch(`${API_BASE_URL}/process-frame`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ image_base64: base64Image }),
@@ -236,7 +237,7 @@ export default function App() {
 
       const base64Image = canvas.toDataURL("image/jpeg", 0.8);
 
-      const response = await fetch("http://127.0.0.1:8000/process-frame", {
+      const response = await fetch(`${API_BASE_URL}/process-frame`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ image_base64: base64Image }),
@@ -244,7 +245,7 @@ export default function App() {
       const data = await response.json();
 
       if (data.sample_boxes && data.sample_boxes.length > 0) {
-        const clickRes = await fetch("http://127.0.0.1:8000/visual-click", {
+        const clickRes = await fetch(`${API_BASE_URL}/visual-click`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({

@@ -32,9 +32,15 @@ from auth import auth_router
 
 app = FastAPI(title="KALKI Core Engine", version="1.0.0")
 
+# CORS configuration targeting Vite dev server origins
+allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -90,6 +96,7 @@ def execute_macro_action(macro: models.VoiceMacro) -> str:
     return "Executed macro"
 
 @app.get("/")
+@app.get("/health")
 def health_check():
     return {"status": "online", "system": "KALKI Jarvis Core Engine"}
 
@@ -262,7 +269,8 @@ def create_macro(payload: MacroCreatePayload, db: Optional[Session] = Depends(ge
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
+        print(f"[Database Error]: {type(e).__name__}")
+        raise HTTPException(status_code=503, detail="Database is currently unavailable.")
 
 @app.get("/macros")
 def list_macros(db: Optional[Session] = Depends(get_db)):
@@ -271,7 +279,8 @@ def list_macros(db: Optional[Session] = Depends(get_db)):
     try:
         return db.query(models.VoiceMacro).all()
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
+        print(f"[Database Error]: {type(e).__name__}")
+        raise HTTPException(status_code=503, detail="Database is currently unavailable.")
 
 @app.get("/audit-logs")
 def get_audit_logs(limit: int = 15, db: Optional[Session] = Depends(get_db)):
@@ -290,7 +299,8 @@ def get_audit_logs(limit: int = 15, db: Optional[Session] = Depends(get_db)):
             for log in logs
         ]
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
+        print(f"[Database Error]: {type(e).__name__}")
+        raise HTTPException(status_code=503, detail="Database is currently unavailable.")
 
 @app.get("/chat-history")
 def get_chat_history(db: Optional[Session] = Depends(get_db)):
@@ -300,7 +310,8 @@ def get_chat_history(db: Optional[Session] = Depends(get_db)):
         messages = db.query(models.ChatMessage).filter(models.ChatMessage.session_id == 1).order_by(models.ChatMessage.timestamp.asc()).all()
         return [{"role": m.role, "content": m.content, "timestamp": m.timestamp.isoformat()} for m in messages]
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
+        print(f"[Database Error]: {type(e).__name__}")
+        raise HTTPException(status_code=503, detail="Database is currently unavailable.")
 
 @app.post("/process-frame")
 async def process_frame(payload: FramePayload):
